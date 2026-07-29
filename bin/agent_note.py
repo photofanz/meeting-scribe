@@ -144,6 +144,17 @@ def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
         "TRANSCRIPT_CHARS": f"{chars:,}",
         "SPEAKER_WARNING": warning,
         "DELIVERABLES": "\n".join(lines),
+        # This entry point skips the review stage entirely, so there is nothing
+        # confirmed and the source is always the raw transcript. review.py
+        # fills both properly; here they are stated rather than left as
+        # unsubstituted placeholders in the prompt.
+        "SOURCE_DESC": "逐字稿（未經清稿）",
+        "CONFIRMED": (
+            "## 已確認事實\n\n"
+            "（本次未經使用者確認流程，沒有任何已確認事實——"
+            "講者姓名、專有名詞、金額日期一律依逐字稿推斷，"
+            "並在文件開頭註明「講者對應為推測」。）\n"
+        ),
     }
 
     text = TASK_TEMPLATE.read_text()

@@ -5,7 +5,12 @@
 **音檔、逐字稿、會議記錄完全不離開你的 Mac。** 不需要專用硬體，不需要任何 SaaS 訂閱，
 不需要 OpenAI / Whisper API key，不需要 HuggingFace token。
 
-實測（Apple M3、128 GB）：**2 小時會議約 10 分鐘轉寫完**，約 9–10× 實時。
+實測（Apple M3、128 GB）：**2 小時會議約 13 分鐘轉寫完**，約 9–10× 實時。
+
+最近一次完整跑通的真實長會議：2 小時 07 分錄音 → 轉寫 13.1 分鐘（9.7× 實時）
+→ 切成 5 片平行掃描、整理出 8 題 → 回答後產出定稿逐字稿與會議記錄的
+Markdown / PDF / Word。順帶一提，那場的聲紋分離把 2 個人分成了 112 群——
+所以才有問題卡這一關。
 
 ---
 
@@ -32,14 +37,28 @@ iPhone 語音備忘錄
 │  合併 → 簡轉繁 → transcript.md           │
 └─────────────────────────────────────────┘
       │
-      ▼  完成通知（唯一離開這台機器的東西）
-  文件撰寫（二選一）
-    A. 對話 agent —— 你回一句「整理這場會議」
-    B. 本機 CLI  —— claude / codex 背景自動接手，不用你在場
+      ▼
+┌─────────────────────────────────────────┐
+│  review 階段（本機 claude / codex CLI）  │
+│                                          │
+│  掃描：切片平行讀完整份逐字稿            │
+│        → transcript_draft.md             │
+│        → questions.json（≤8 張卡）       │
+│        │                                 │
+│   ── 你在網頁上「點選」回答 ──           │
+│        │                                 │
+│  定稿：答案用 Python regex 套回          │
+│        → transcript_clean.md             │
+│        → 會議記錄由定稿逐字稿寫成        │
+└─────────────────────────────────────────┘
       │
       ▼
-  清稿 → 會議記錄 → PDF / Markdown / Word → 歸檔
+  PDF / Markdown / Word → 歸檔 → 完成通知
 ```
+
+長會議不是丟一個大 prompt 給模型就好——2 小時的逐字稿約 127 KB，塞不進單次
+context，而且失敗是無聲的：模型讀完開頭，自信地寫出前 20 分鐘的會議記錄，然後
+exit 0。切片與提問這兩道關卡就是為了擋這件事，設計理由見 [docs/REVIEW.md](docs/REVIEW.md)。
 
 ---
 
@@ -62,7 +81,7 @@ iPhone 語音備忘錄
 ## 安裝
 
 ```bash
-git clone https://github.com/<you>/meeting-scribe.git ~/Meetings
+git clone https://github.com/photofanz/meeting-scribe.git ~/Meetings
 cd ~/Meetings
 ./install.sh
 ```
@@ -91,11 +110,14 @@ cd ~/Meetings
   "port": 8765,
   "service_label": "com.meetingscribe.uploader",
   "notify": {
-    "enabled": true,
-    "bin": "~/.local/bin/hermes",
-    "target": "telegram"
+    "mode": "none",
+    "events": ["awaiting_answers", "done", "error"],
+    "telegram": {"bot_token": "", "chat_id": ""},
+    "command": "",
+    "webhook": {"url": "", "secret": ""}
   },
   "branding": {
+    "brand_name": "MEETING NOTES",
     "client_footer": "本文件內容以雙方會議討論為準。",
     "participants_hint": "例：王總、張經理、我"
   },
@@ -104,24 +126,50 @@ cd ~/Meetings
     "diarization_threads": 4
   },
   "agent": {
-    "mode": "manual",
+    "mode": "review",
     "backend": "claude",
     "bin": null,
     "model": null,
-    "timeout_sec": 3600
+    "timeout_sec": 3600,
+    "chunk_chars": 14000,
+    "max_parallel": 3,
+    "max_questions": 8
   }
 }
 ```
 
+每個鍵都可省略，省略就吃 `bin/config.py` 的預設值；`config.example.json` 裡有逐鍵說明。
 改完跑 `./install.sh`（重生 plist）或 `./bin/service.sh restart`。
 
-**通知**：轉寫完成會呼叫 `notify.bin send --to <target> "<訊息>"`。
-預設接 [Hermes Agent](https://hermes-agent.nousresearch.com)，但任何吃這組參數的 CLI 都行。
-把 `enabled` 設 `false`，訊息會寫進 `logs/undelivered.log`，轉寫流程照跑。
+**通知**（`notify.mode`，四選一，預設完全不推播）：
 
-**文件撰寫**：`agent.mode` 設 `auto`，轉寫完成後會直接呼叫本機的 `claude` 或
-`codex` CLI 把文件寫完並推給你，全程不用你在場。設 `manual`（預設）則停在轉寫，
-等你回一句「整理這場會議」。細節見 [docs/AGENT.md](docs/AGENT.md)。
+| mode | 做什麼 | 需要什麼 |
+|---|---|---|
+| `none` | 不推播，所有狀態都在 `/jobs` 頁看 | 無（預設，讓全新 clone 不依賴任何其他軟體） |
+| `telegram` | 直接打 Telegram Bot API | @BotFather 的 token 與 chat id |
+| `command` | 呼叫你原本就在用的通知 CLI | 一組 argv 樣板 |
+| `webhook` | POST 帶 HMAC-SHA256 簽章的 JSON 到你的服務 | url ＋ secret |
+
+```bash
+.venv/bin/python bin/notify_setup.py     # 互動式填完並自動驗證
+```
+
+`notify.events` 決定哪些狀態值得推。`command` 模式的 `{message}` / `{files}` 是在
+argv 切分**之後**才代入，所以會議標題含引號或空白也不會變成多餘參數。推不出去的
+訊息會寫進 `logs/undelivered.log`，主流程照跑。舊版 `notify.enabled/bin/target`
+設定檔仍相容，載入時自動對應到 `command` 模式。
+
+**文件撰寫**（`agent.mode`）：
+
+| mode | 行為 |
+|---|---|
+| `review` | **預設。** 掃描 → 在 `/job/<id>` 出題 → 你點選回答 → 才寫文件 |
+| `auto` | 掃描與撰寫連續跑完，全用 `best_guess`，沒有人在迴圈裡 |
+| `manual` | 停在逐字稿，由你（或對話 agent）手動啟動 |
+
+`review` 是預設，因為那些答案正是阻止會議記錄捏造人名與數字的東西；`auto` 產出的
+文件品質較差，而且文件開頭會自己說明這件事。細節見 [docs/REVIEW.md](docs/REVIEW.md)
+與 [docs/AGENT.md](docs/AGENT.md)。
 
 ---
 
@@ -151,18 +199,36 @@ cd ~/Meetings
 `formats` 是全域的，對這個 job 的每份文件都套用。兩段都有防呆：一項都不勾會擋下，
 後端另有保險會強制回到「會議記錄」。
 
-### 3. 等通知
+### 3. 回答問題（`agent.mode = "review"`，預設）
 
-轉寫完成推一則訊息，列出這次要產出什麼。
+轉寫完成後，系統會平行讀完整份逐字稿，然後把**只有你才知道答案**的事情整理成
+最多 8 張卡片，狀態轉為 `awaiting_answers`，並在 `/job/<id>` 等你。
 
-- `agent.mode = "manual"`（預設）：回覆「整理這場會議」，對話 agent 依 `meta.json` 接手。
-- `agent.mode = "auto"`：本機 `claude` / `codex` CLI 自動接手，寫完直接把檔案傳給你。
+卡片一律設計成**用點的就能回答**——要你打一段字的問題就是錯的問題。五種類型：
 
-兩種模式共用同一份規格 `templates/NOTE_SPECS.md` —— **那份檔案就是給 agent 讀的合約**，
-所以產出的文件結構一致。手動重跑某個 job：
+| 類型 | 什麼時候出現 |
+|---|---|
+| `speaker` | 某個聲紋標籤（講者1／講者2）到底是誰。排第一，因為把話講錯人比什麼都嚴重 |
+| `term` | 同一個專有名詞被 ASR 拼成好幾種寫法，要選一個正式版本 |
+| `unclear` | 音質太差，某個關鍵數字／日期／金額救不回來 |
+| `conflict` | 逐字稿裡有兩句互相矛盾，必須有一個勝出 |
+| `undecided` | 會議其實沒有結論，但會議記錄非得寫一句 |
+
+答完按送出，答案會用 Python `re.sub` **機械式**套回逐字稿（不是交給模型記憶對照表），
+產出 `transcript_clean.md`，會議記錄才從這份定稿寫起。實際替換了什麼，會列在定稿
+逐字稿末尾的更正表——列的是真的做了什麼，不是模型說它做了什麼。
+
+改成 `manual` 則停在逐字稿，回一句「整理這場會議」由對話 agent 接手；改成 `auto`
+則全程不問你。三種模式共用同一份規格 `templates/NOTE_SPECS.md` —— **那份檔案就是
+給 agent 讀的合約**，所以產出的文件結構一致。
+
+手動重跑某個 job：
 
 ```bash
-.venv/bin/python bin/agent_note.py latest --deliver
+.venv/bin/python bin/review.py latest --stage scan             # 只出題
+.venv/bin/python bin/review.py latest --stage write --deliver  # 套用答案並寫文件
+.venv/bin/python bin/review.py latest --stage auto  --deliver  # 兩段連跑，不問人
+.venv/bin/python bin/chunker.py archive/<job_id>/transcript.md # 只看切片計畫，不花模型時間
 ```
 
 ---
@@ -171,18 +237,30 @@ cd ~/Meetings
 
 ```
 archive/<YYYY-MM-DD>_<對象>_<6碼>/
-    source.m4a           原始音檔
-    meta.json            上傳表單內容 + 產出選項
-    status.json          處理進度（UI 與 agent 都輪詢這個）
-    transcript.md        逐字稿（繁體、講者標籤、時間戳）
-    transcript.json      結構化（每段的講者與起訖時間）
-    transcript.txt       純文字
-    transcript_clean.md  校訂後逐字稿（勾了才產）
-    note_*.md/.pdf/.docx 會議記錄
-    INDEX.md             檔案清單與機密層級
+    source.m4a            原始音檔
+    meta.json             上傳表單內容 + 產出選項
+    status.json           處理進度（UI 與 agent 都輪詢這個）
+    state.json            狀態機與各階段時間戳
+    transcript.md         逐字稿（繁體、講者標籤、時間戳）
+    transcript.json       結構化（每段的講者與起訖時間）
+    transcript.txt        純文字
+    questions.json        掃描階段整理出的問題卡
+    answers.json          你在網頁上的回答
+    transcript_draft.md   掃描後、套答案前的草稿
+    transcript_clean.md   定稿逐字稿（+ .pdf / .docx，末尾附更正表）
+    note_*.md/.pdf/.docx  會議記錄
+    action_items.json     待辦事項
+    delivery.json         這次交付了哪些檔案
+    agent_report.json     agent 自述做了什麼
+    INDEX.md              檔案清單與機密層級
+    .chunks/ .review/     切片與提示詞暫存（出問題時的診斷材料）
 ```
 
 後綴 6 碼是為了同一天同對象開兩場會不撞名。
+
+jobs 頁的「清理產出」只刪得掉可重生的那些檔案——**音檔、原始逐字稿、你的答案與
+job metadata 永遠保留**，所以任何一場會議都能事後換模板重跑，或改完人名重寫，
+不必重新上傳錄音。
 
 ---
 
@@ -191,14 +269,23 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 | 檔案 | 做什麼 |
 |---|---|
 | `bin/config.py` | 部署設定載入（`ROOT` 由檔案位置推導，非硬編碼） |
-| `bin/upload_server.py` | 上傳網頁（FastAPI，分段上傳） |
+| `bin/upload_server.py` | 上傳網頁與 jobs／job 頁（FastAPI，分段上傳，問題卡 UI） |
 | `bin/process_meeting.py` | ffmpeg → 聲紋分離 ∥ ASR → 字級切分 → 簡轉繁 |
 | `bin/zhtw.py` | 簡轉繁（s2tw + 台灣商務／技術詞修正表） |
+| `bin/jobstate.py` | job 狀態的唯一真相（`state.json`，UI 只讀這個） |
+| `bin/chunker.py` | 逐字稿決定性切片（不會把一個發言切兩半） |
+| `bin/review.py` | 兩階段產文：掃描出題 → 套用答案 → 寫文件 |
+| `bin/agent_note.py` | 單次撰寫（短會議夠用，長會議走 `review.py`） |
+| `bin/notify.py` | 對外通知的唯一出口（none／telegram／command／webhook） |
+| `bin/notify_setup.py` | 互動式設定通知並當場驗證送得出去 |
 | `bin/make_pdf.py` | Markdown → 品牌 HTML → PDF（headless Chrome） |
 | `bin/make_docx.py` | Markdown → Word（pandoc + CJK 字型範本） |
-| `bin/run_job.sh` | 轉寫完成後發通知 |
+| `bin/run_job.sh` | 比 HTTP request 活得久的 shell wrapper，依 `agent.mode` 決定後續 |
 | `bin/service.sh` | launchd 控制器 |
 | `templates/NOTE_SPECS.md` | 各類會議記錄的結構規格（agent 讀這份） |
+| `templates/SCAN_TASK.md` | 掃描階段給 agent 的指令 |
+| `templates/PARTIAL_TASK.md` | map-reduce 撰寫時，單一切片的取材指令 |
+| `templates/AGENT_TASK.md` | 撰寫階段給 agent 的指令 |
 
 模型：
 
@@ -234,10 +321,13 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 
 ## 限制（都是真的踩過的）
 
-1. **講者標籤沒有姓名**，是聲紋分群結果（講者1／講者2），要靠 agent 依內容推斷對應。
+1. **講者標籤沒有姓名**，是聲紋分群結果（講者1／講者2）。`review` 模式會直接問你
+   哪個標籤是誰，答完才機械式替換；`auto` 模式則只能靠內容推斷，會猜錯。
 2. **線上會議錄音的聲紋分離會失準。** 各人裝置與網路不同造成音色差異，實測一場三人
-   線上會議被分成 61 群。實體會議、單一麥克風的效果好得多。**分不準時不要硬猜是誰。**
-3. **逐字稿一定有同音錯字**，LLM 清稿是必要步驟，不是加分項。
+   線上會議被分成 61 群，另一場被分成 112 群。實體會議、單一麥克風的效果好得多。
+   **分不準時不要硬猜是誰**——這正是問題卡存在的理由。
+3. **逐字稿一定有同音錯字**，清稿是必要步驟，不是加分項。實測同一個姓氏被 ASR 寫成
+   七種版本（革新／葛新／葛星／葛晶／可欣／可信／可惜），這種只能問人。
 4. **要連得到 Tailscale**（或至少同一區網）。
 5. **Mac 要開機且已登入。** 這是 LaunchAgent，開機停在登入畫面不會啟動——
    無人值守的機器請開自動登入。

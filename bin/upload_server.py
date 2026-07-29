@@ -11,6 +11,7 @@ Nothing leaves this machine except the final Telegram notification.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -25,9 +26,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jobstate  # noqa: E402
 from config import CONFIG, ROOT, hermes_bin  # noqa: E402
 
 INBOX = ROOT / "inbox"
@@ -38,6 +41,7 @@ LOGS = ROOT / "logs"
 TOKEN_FILE = ROOT / ".token"
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 PIPELINE = ROOT / "bin" / "process_meeting.py"
+REVIEW = ROOT / "bin" / "review.py"
 HERMES = hermes_bin()
 
 for d in (INBOX, JOBS, ARCHIVE, TMP, LOGS):
@@ -51,6 +55,17 @@ else:
     TOKEN_FILE.chmod(0o600)
 
 app = FastAPI(title="Meeting Uploader")
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _json_errors(request: Request, exc: StarletteHTTPException):
+    """One error shape for the whole API: {"error": "..."} + a real status.
+
+    FastAPI's default is {"detail": ...}; the web UI renders `error` inline,
+    and the old upload page only ever reads the body as text, so unifying here
+    is safe for both.
+    """
+    return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
 
 def check(k: str | None):
@@ -88,6 +103,117 @@ def slug(s: str, fallback: str = "會議") -> str:
     s = unicodedata.normalize("NFKC", s)
     s = re.sub(r"[\\/:*?\"<>|\s]+", "-", s)
     return s.strip("-.")[:40] or fallback
+
+
+# -------------------------------------------------------------- job helpers --
+# Every job-id -> path resolution in this file goes through jobstate.job_dir(),
+# which refuses anything that escapes archive/. Nothing here concatenates a
+# user-supplied string onto a path.
+
+def jd(job_id: str, must_exist: bool = True) -> Path:
+    try:
+        d = jobstate.job_dir(job_id)
+    except ValueError:
+        raise HTTPException(400, "無效的 job id")
+    if must_exist and not d.is_dir():
+        raise HTTPException(404, f"找不到會議 {job_id}")
+    return d
+
+
+def safe_child(d: Path, name: str) -> Path:
+    """Resolve `name` inside `d`, refusing traversal and symlink escapes."""
+    if not name or "/" in name or "\\" in name or ".." in name or name.startswith("."):
+        raise HTTPException(400, "無效的檔名")
+    p = (d / name).resolve()
+    if not str(p).startswith(str(d.resolve()) + os.sep):
+        raise HTTPException(400, "無效的檔名")
+    if not p.is_file():
+        raise HTTPException(404, f"找不到檔案 {name}")
+    return p
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def is_protected(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pat) for pat in jobstate.PROTECTED)
+
+
+# Scratch directories the review stages build. Cheap to regenerate, and they
+# are what actually holds the disk after a long job.
+SCRATCH_DIRS = (".chunks", ".review")
+
+
+def cleanup_plan(d: Path) -> dict:
+    """What "清理產出" would delete, without deleting anything."""
+    names: list[str] = []
+    seen: set[str] = set()
+    freed = 0
+    for g in jobstate.OUTPUT_GLOBS:
+        for p in sorted(d.glob(g)):
+            if not p.is_file() or p.name in seen or is_protected(p.name):
+                continue
+            seen.add(p.name)
+            freed += p.stat().st_size
+            names.append(p.name)
+    for sub in SCRATCH_DIRS:
+        sd = d / sub
+        if sd.is_dir():
+            freed += jobstate.dir_size(sd)
+            names.append(sub + "/")
+    audio = next((p for p in d.glob("source.*") if p.is_file()), None)
+    return {
+        "outputs": {"count": len(names), "bytes": freed, "names": names},
+        "total": {"bytes": jobstate.dir_size(d)},
+        "audio": {"bytes": audio.stat().st_size if audio else 0},
+    }
+
+
+def spawn_review(job_id: str, d: Path, stage: str) -> None:
+    """Start review.py detached, appending to the job's agent log.
+
+    The HTTP request must not wait on a model call that can run for minutes,
+    so this is fire-and-forget: the browser learns what happened by polling
+    state.json, and the log endpoint is the escape hatch when it goes wrong.
+    """
+    log_path = LOGS / f"{job_id}-agent.log"
+    log = log_path.open("ab")
+    try:
+        log.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"review.py --stage {stage} (web) ===\n".encode())
+        log.flush()
+        subprocess.Popen(
+            [str(VENV_PY), str(REVIEW), str(d), "--stage", stage, "--deliver"],
+            stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, cwd=str(ROOT))
+    finally:
+        log.close()
+
+
+def require_review():
+    if not REVIEW.exists():
+        raise HTTPException(503, "bin/review.py 尚未安裝，無法啟動撰寫")
+
+
+def tail_file(path: Path, lines: int) -> str:
+    if not path.exists():
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > 262_144:                       # only ever read the tail
+            f.seek(size - 262_144)
+        data = f.read()
+    return "\n".join(data.decode("utf-8", "replace").splitlines()[-lines:])
 
 
 # ------------------------------------------------------------------ HTML ----
@@ -154,8 +280,15 @@ PAGE = r"""<!doctype html>
   .chk small{display:block;font-size:12.5px;color:var(--sub);font-weight:400;margin-top:3px;
     line-height:1.4}
   .warn{color:var(--err);font-size:13px;margin-top:10px}
+  .top{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin:8px 0 4px}
+  .top h1{margin:0}
+  a.nav{color:var(--accent);text-decoration:none;font-size:14.5px;font-weight:600;
+    white-space:nowrap;padding:8px 0}
+  a.jumpto{display:block;margin-top:14px;padding:13px;text-align:center;font-size:15px;
+    font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--line);
+    border-radius:11px;background:#fff}
 </style></head><body><div class="wrap">
-<h1>會議上傳</h1>
+<div class="top"><h1>會議上傳</h1><a class="nav" id="navJobs" href="/jobs">全部會議 ›</a></div>
 <div class="sub">本機轉寫 · 音檔不離開這台 Mac</div>
 
 <form id="f" class="card">
@@ -227,6 +360,8 @@ PAGE = r"""<!doctype html>
 <div class="card hide" id="prog">
   <div class="bar"><i id="pb"></i></div>
   <div class="status" id="st">準備中…</div>
+  <a class="jumpto hide" id="toJob" href="/jobs">到這場會議 ›</a>
+  <a class="jumpto hide" id="toJobs" href="/jobs">全部會議 ›</a>
 </div>
 </div>
 
@@ -234,6 +369,8 @@ PAGE = r"""<!doctype html>
 const K = new URLSearchParams(location.search).get('k') || localStorage.getItem('mk') || '';
 if (K) localStorage.setItem('mk', K);
 const $ = id => document.getElementById(id);
+const kq = p => p + (K ? (p.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(K) : '');
+$('navJobs').href = kq('/jobs');
 let FILE = null;
 $('date').value = new Date().toISOString().slice(0,10);
 
@@ -332,12 +469,16 @@ $('f').onsubmit = async e => {
     r = await fetch(`/api/upload/complete?k=${K}&upload_id=${upload_id}`, {method:'POST'});
     if (!r.ok) throw new Error('complete failed: '+await r.text());
     const {job_id} = await r.json();
+    $('toJob').href = kq('/job/' + encodeURIComponent(job_id));
+    $('toJobs').href = kq('/jobs');
+    $('toJob').classList.remove('hide');
+    $('toJobs').classList.remove('hide');
 
     while (true){
       await new Promise(s=>setTimeout(s,2500));
       const s = await (await fetch(`/api/job/${job_id}?k=${K}`)).json();
       if (s.state === 'done'){
-        setP(1, `完成 ✓\n${s.result.num_speakers} 位講者 · ${Math.round(s.result.duration/60)} 分鐘 · 耗時 ${s.result.elapsed_sec}s (${s.result.realtime_factor}× 實時)\n\n已傳訊息到 Telegram，回覆即可開始整理會議記錄。`, 'done');
+        setP(1, `轉寫完成 ✓\n${s.result.num_speakers} 位講者 · ${Math.round(s.result.duration/60)} 分鐘 · 耗時 ${s.result.elapsed_sec}s (${s.result.realtime_factor}× 實時)\n\n接著會掃描逐字稿並整理出待確認的問題，到會議頁面回答即可開始撰寫。`, 'done');
         break;
       }
       if (s.state === 'error'){ setP(1, '失敗：\n'+(s.error||'').slice(0,400), 'fail'); break; }
@@ -429,26 +570,1108 @@ def upload_complete(k: str = "", upload_id: str = ""):
     return {"job_id": job_id, "outdir": str(outdir)}
 
 
-@app.get("/api/job/{job_id}")
-def job_status(job_id: str, k: str = ""):
-    check(k)
-    p = ARCHIVE / job_id / "status.json"
-    if not p.exists():
-        return JSONResponse({"state": "running", "step_label": "啟動中",
-                             "progress": 0, "message": ""})
-    return JSONResponse(json.loads(p.read_text()))
+# ------------------------------------------------------ jobs / detail UI ----
+# One stylesheet for both pages, extending the upload form's language: white
+# cards on #fbfbfd, hairline borders instead of shadows, the same navy accent,
+# and red kept for exactly two things — 待回答 and 刪除.
+CSS = r"""
+  :root{
+    --bg:#fbfbfd; --card:#fff; --ink:#1d1d1f; --sub:#6e6e73;
+    --line:#e5e5ea; --hair:#d2d2d7; --accent:#1A2E4A; --ok:#0a7c42;
+    --err:#d70015; --soft:#f5f5f7;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang TC",
+      "Helvetica Neue",sans-serif;
+    padding:max(20px,env(safe-area-inset-top)) 20px calc(56px + env(safe-area-inset-bottom));}
+  .wrap{max-width:760px;margin:0 auto}
+  a{color:var(--accent);text-decoration:none}
+  h1{font-size:26px;letter-spacing:-.022em;margin:0;font-weight:600}
+  h2{font-size:14px;font-weight:600;letter-spacing:.02em;margin:0 0 18px;color:var(--sub)}
+  .sub{color:var(--sub);font-size:14px}
+  .top{display:flex;align-items:center;justify-content:space-between;gap:16px;
+    min-height:44px;margin-bottom:14px}
+  .nav{font-size:14.5px;font-weight:600;white-space:nowrap;display:inline-flex;
+    align-items:center;min-height:44px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:20px;margin-bottom:16px}
+  .hide{display:none !important}
+  .mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace}
+
+  /* --- badges ------------------------------------------------------------ */
+  .badge{display:inline-flex;align-items:center;font-size:12px;font-weight:600;
+    padding:3px 9px;border-radius:99px;border:1px solid var(--hair);color:var(--sub);
+    background:#fff;letter-spacing:.02em;white-space:nowrap}
+  .badge.s-run{border-color:#ccd8e6;color:var(--accent);background:#f3f7fb}
+  .badge.s-ask{border-color:#f0c3c7;color:var(--err);background:#fdf3f4}
+  .badge.s-done{border-color:#c2e0d0;color:var(--ok);background:#f2f9f5}
+  .badge.s-err{border-color:#f0c3c7;color:var(--err);background:#fdf3f4}
+  .badge.s-arch{border-color:var(--hair);color:#8e8e93;background:var(--soft)}
+
+  /* --- buttons ----------------------------------------------------------- */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    min-height:44px;padding:11px 17px;font:600 15px/1.2 inherit;border:1px solid var(--hair);
+    border-radius:10px;background:#fff;color:var(--ink);cursor:pointer;
+    -webkit-appearance:none;appearance:none}
+  .btn:active{background:var(--soft)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.danger{color:var(--err);border-color:#eec2c6}
+  .btn.danger.solid{background:var(--err);border-color:var(--err);color:#fff}
+  .btn:disabled{opacity:.4;cursor:default}
+  .btn.wide{width:100%}
+  .btnrow{display:flex;flex-wrap:wrap;gap:8px}
+
+  /* --- inline error strip ------------------------------------------------ */
+  .strip{border:1px solid #eec2c6;background:#fdf3f4;color:var(--err);border-radius:10px;
+    padding:11px 14px;font-size:14px;margin-bottom:16px;line-height:1.5}
+  .strip.ok{border-color:#c2e0d0;background:#f2f9f5;color:var(--ok)}
+
+  /* --- forms ------------------------------------------------------------- */
+  label{display:block;font-size:13px;color:var(--sub);margin:16px 0 6px;font-weight:500}
+  label.first{margin-top:0}
+  input,select,textarea{width:100%;padding:12px 14px;font-size:16px;font-family:inherit;
+    border:1px solid var(--line);border-radius:11px;background:#fff;color:var(--ink);
+    -webkit-appearance:none;appearance:none}
+  input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  textarea{min-height:76px;resize:vertical;line-height:1.6}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+  .chk{display:flex;align-items:flex-start;gap:11px;margin:0;padding:12px 14px;
+    border:1px solid var(--line);border-radius:11px;background:#fff;cursor:pointer;
+    font-size:15.5px;font-weight:500;min-height:44px;transition:.15s}
+  .chk.on{border-color:var(--accent);background:#f3f7fb}
+  .chk input{width:21px;height:21px;flex:0 0 21px;margin:0;accent-color:var(--accent);
+    -webkit-appearance:auto;appearance:auto;padding:0;border:0}
+  .opts{display:flex;flex-direction:column;gap:8px}
+  .opts.row{flex-direction:row;flex-wrap:wrap}
+  .opts.row .chk{flex:1 1 30%}
+
+  /* --- modal ------------------------------------------------------------- */
+  .veil{position:fixed;inset:0;background:rgba(29,29,31,.34);display:flex;
+    align-items:center;justify-content:center;padding:20px;z-index:50;
+    -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px)}
+  .modal{background:#fff;border-radius:16px;max-width:620px;width:100%;
+    max-height:82vh;display:flex;flex-direction:column;overflow:hidden;
+    border:1px solid var(--line)}
+  .modal .mh{padding:18px 20px 0;font-size:17px;font-weight:600}
+  .modal .mb{padding:12px 20px;overflow:auto;font-size:14.5px;color:var(--sub);
+    line-height:1.6;flex:1}
+  .modal .mf{padding:14px 20px 18px;display:flex;gap:8px;justify-content:flex-end;
+    border-top:1px solid var(--line)}
+  .modal pre{white-space:pre-wrap;word-break:break-word;font-size:13px;color:var(--ink);
+    background:var(--soft);border-radius:10px;padding:14px;margin:0;line-height:1.65}
+  @media (max-width:520px){ .modal .mf{flex-direction:column-reverse} .modal .mf .btn{width:100%} }
+"""
 
 
+JOBS_PAGE = r"""<!doctype html>
+<html lang="zh-Hant"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>會議</title>
+<style>__CSS__
+  .tools{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .tools input[type=search]{flex:2 1 220px;min-width:0}
+  .tools select{flex:1 1 130px;min-width:0;padding-right:34px;
+    background-image:linear-gradient(45deg,transparent 50%,var(--sub) 50%),
+      linear-gradient(135deg,var(--sub) 50%,transparent 50%);
+    background-position:calc(100% - 18px) 21px,calc(100% - 13px) 21px;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .toggle{display:flex;align-items:center;gap:9px;font-size:14px;color:var(--sub);
+    min-height:44px;cursor:pointer;padding:0 2px;white-space:nowrap}
+  .toggle input{width:20px;height:20px;flex:0 0 20px;accent-color:var(--accent);
+    -webkit-appearance:auto;appearance:auto;padding:0;border:0}
+  .list{display:flex;flex-direction:column;gap:10px}
+  .job{display:block;background:#fff;border:1px solid var(--line);border-radius:14px;
+    padding:16px 18px;color:inherit;transition:.15s}
+  .job:active{background:var(--soft)}
+  .job.ask{border-color:#eec2c6}
+  .job.arch{opacity:.62}
+  .jt{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .jtitle{font-size:16.5px;font-weight:600;letter-spacing:-.01em;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+  .jmeta{font-size:13.5px;color:var(--sub);margin-top:5px;
+    display:flex;flex-wrap:wrap;gap:4px 10px}
+  .cta{display:inline-flex;align-items:center;gap:6px;margin-top:12px;min-height:44px;
+    padding:10px 15px;border-radius:10px;background:#fdf3f4;border:1px solid #eec2c6;
+    color:var(--err);font-size:14.5px;font-weight:600}
+  .pbar{height:5px;background:var(--line);border-radius:99px;overflow:hidden;margin:12px 0 6px}
+  .pbar>i{display:block;height:100%;background:var(--accent);transition:width .3s}
+  /* Scanning and writing have no measurable percentage — an indeterminate bar
+     is honest where a stale 100% from the ASR stage is not. */
+  .pbar.indet>i{width:34%;animation:slide 1.5s cubic-bezier(.4,0,.2,1) infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  .pstep{font-size:13px;color:var(--sub)}
+  .empty{text-align:center;color:var(--sub);font-size:14.5px;padding:52px 20px;
+    border:1px dashed var(--hair);border-radius:14px;background:#fff}
+  .count{font-size:13px;color:#a1a1a6;margin:0 2px 12px}
+</style></head><body><div class="wrap">
+
+<div class="top">
+  <h1>會議</h1>
+  <a class="nav" id="navUp" href="/">📤 上傳新錄音</a>
+</div>
+<div class="sub" style="margin-bottom:20px">本機轉寫 · 音檔不離開這台 Mac</div>
+
+<div id="err" class="strip hide"></div>
+
+<div class="tools">
+  <input id="q" type="search" placeholder="搜尋主題或客戶" autocomplete="off">
+  <select id="fstate">
+    <option value="">全部狀態</option>
+    <option value="awaiting_answers">待回答</option>
+    <option value="transcribing">轉寫中</option>
+    <option value="scanning">掃描中</option>
+    <option value="writing">撰寫中</option>
+    <option value="done">完成</option>
+    <option value="error">失敗</option>
+  </select>
+  <select id="sort">
+    <option value="new">最新</option>
+    <option value="old">最舊</option>
+    <option value="big">檔案最大</option>
+    <option value="todo">待處理優先</option>
+  </select>
+  <label class="toggle"><input type="checkbox" id="arch"><span>顯示已封存</span></label>
+</div>
+
+<div class="count" id="count"></div>
+<div class="list" id="list"></div>
+</div>
+
+<script>
+const K = new URLSearchParams(location.search).get('k') || localStorage.getItem('mk') || '';
+if (K) localStorage.setItem('mk', K);
+const $ = id => document.getElementById(id);
+const kq = p => p + (K ? (p.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(K) : '');
+$('navUp').href = kq('/');
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hb = b => { b = +b || 0; if (b < 1024) return b + ' B';
+  const u = ['KB','MB','GB','TB']; let i = -1;
+  do { b /= 1024; i++; } while (b >= 1024 && i < 3);
+  return b.toFixed(b < 10 ? 1 : 0) + ' ' + u[i]; };
+const dur = s => { s = Math.round(+s || 0); if (!s) return '';
+  const h = Math.floor(s/3600), m = Math.round(s%3600/60);
+  return h ? h + ' 小時 ' + m + ' 分' : Math.max(1, m) + ' 分'; };
+const MT = {general:'一般討論', client:'顧問／客戶', interview:'訪談／研究'};
+const SCLS = {awaiting_answers:'s-ask', error:'s-err', done:'s-done',
+              transcribing:'s-run', scanning:'s-run', writing:'s-run'};
+const RUNNING = ['transcribing','scanning','writing'];
+// status.json only measures the ASR stage, so the later stages get their own
+// line rather than a percentage that stopped moving.
+const STEP = {scanning:'正在掃描逐字稿，整理待確認的問題…', writing:'正在撰寫文件…'};
+function stepText(j){
+  if (j.state === 'transcribing')
+    return (j.step_label || '轉寫中') + (j.message ? ' — ' + String(j.message).slice(0, 80) : '');
+  return STEP[j.state] || j.state_label || '';
+}
+
+let JOBS = [], LAST = '';
+
+function showErr(m){ $('err').textContent = m; $('err').classList.remove('hide'); }
+function clearErr(){ $('err').classList.add('hide'); }
+
+function render(){
+  const q = ($('q').value || '').trim().toLowerCase();
+  const st = $('fstate').value;
+  const showArch = $('arch').checked;
+  let rows = JOBS.filter(j => showArch || !j.archived);
+  if (st) rows = rows.filter(j => j.state === st);
+  if (q) rows = rows.filter(j =>
+    ((j.title || '') + ' ' + (j.client || '')).toLowerCase().includes(q));
+
+  const key = j => (j.date || '') + ' ' + String(j.updated_at || 0).padStart(16, '0');
+  const sort = $('sort').value;
+  if (sort === 'new')      rows.sort((a,b) => key(b).localeCompare(key(a)));
+  else if (sort === 'old') rows.sort((a,b) => key(a).localeCompare(key(b)));
+  else if (sort === 'big') rows.sort((a,b) => (b.size_bytes||0) - (a.size_bytes||0));
+  else {
+    const rank = j => j.needs_user ? 0 : (j.state === 'error' ? 1
+                    : (RUNNING.includes(j.state) ? 2 : 3));
+    rows.sort((a,b) => rank(a) - rank(b) || key(b).localeCompare(key(a)));
+  }
+
+  $('count').textContent = rows.length
+    ? rows.length + ' 場會議' + (rows.length !== JOBS.length ? '（共 ' + JOBS.length + '）' : '')
+    : '';
+
+  if (!rows.length){
+    $('list').innerHTML = '<div class="empty">' +
+      (JOBS.length ? '沒有符合條件的會議' : '還沒有任何會議，先去上傳一段錄音吧') + '</div>';
+    return;
+  }
+
+  $('list').innerHTML = rows.map(j => {
+    const bits = [j.client, j.date, dur(j.duration), MT[j.meeting_type],
+                  hb(j.size_bytes)].filter(Boolean);
+    const open = +j.questions_open || 0;
+    const running = RUNNING.includes(j.state);
+    return '<a class="job ' + (open ? 'ask ' : '') + (j.archived ? 'arch' : '') + '" href="' +
+      esc(kq('/job/' + encodeURIComponent(j.job_id))) + '">' +
+      '<div class="jt">' +
+        '<span class="badge ' + (SCLS[j.state] || '') + '">' + esc(j.state_label || j.state) + '</span>' +
+        (j.archived ? '<span class="badge s-arch">已封存</span>' : '') +
+        '<span class="jtitle">' + esc(j.title || j.job_id) + '</span>' +
+      '</div>' +
+      (bits.length ? '<div class="jmeta">' +
+        bits.map(b => '<span>' + esc(b) + '</span>').join('<span>·</span>') + '</div>' : '') +
+      (j.error ? '<div class="jmeta" style="color:var(--err)">' +
+        esc(String(j.error).slice(0, 160)) + '</div>' : '') +
+      (running ? '<div class="pbar' + (j.state === 'transcribing' ? '' : ' indet') +
+        '"><i style="' + (j.state === 'transcribing'
+          ? 'width:' + Math.round(100 * (+j.progress || 0)) + '%' : '') +
+        '"></i></div><div class="pstep">' + esc(stepText(j)) + '</div>' : '') +
+      (open ? '<div class="cta">' + open + ' 題待回答 ›</div>' : '') +
+    '</a>';
+  }).join('');
+}
+
+async function poll(){
+  try {
+    const r = await fetch(kq('/api/jobs?archived=1'));
+    const t = await r.text();
+    if (!r.ok){
+      let m = 'HTTP ' + r.status;
+      try { m = JSON.parse(t).error || m; } catch(_){}
+      showErr(r.status === 401 ? '權杖無效，請用含 ?k=… 的網址開啟本頁' : m);
+      return;
+    }
+    clearErr();
+    if (t === LAST) return;          // nothing moved: leave the DOM alone
+    LAST = t;
+    JOBS = JSON.parse(t).jobs || [];
+    render();
+  } catch(e){ showErr('連線失敗：' + e.message); }
+}
+
+['q','fstate','sort','arch'].forEach(id =>
+  $(id).addEventListener('input', render));
+poll();
+setInterval(poll, 5000);
+</script></body></html>"""
+
+
+DETAIL_PAGE = r"""<!doctype html>
+<html lang="zh-Hant"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>會議</title>
+<style>__CSS__
+  .hero{margin-bottom:22px}
+  .hero .jt{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:8px}
+  .hero h1{font-size:24px}
+  .prog{margin-top:14px}
+  .pbar{height:5px;background:var(--line);border-radius:99px;overflow:hidden;margin-bottom:6px}
+  .pbar>i{display:block;height:100%;background:var(--accent);transition:width .3s}
+  .pbar.indet>i{width:34%;animation:slide 1.5s cubic-bezier(.4,0,.2,1) infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+
+  /* --- question cards ---------------------------------------------------- */
+  .qcard{border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:12px}
+  .qcard.ans{border-color:#c2e0d0}
+  .qhead{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    margin-bottom:10px}
+  .qn{font-size:12px;color:#a1a1a6;font-variant-numeric:tabular-nums}
+  .qq{font-size:16.5px;font-weight:600;line-height:1.5;margin-bottom:12px;
+    letter-spacing:-.01em}
+  .ev{background:var(--soft);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+  .evrow{display:flex;gap:10px;font-size:13.5px;line-height:1.6;color:var(--ink)}
+  .evrow+.evrow{margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+  .ts{flex:0 0 auto;color:var(--sub);font-variant-numeric:tabular-nums;
+    font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;font-size:12.5px;
+    padding-top:1px}
+  .qopts{display:flex;flex-wrap:wrap;gap:8px}
+  .opt{display:inline-flex;align-items:center;gap:7px;min-height:44px;padding:10px 15px;
+    border:1px solid var(--hair);border-radius:10px;background:#fff;color:var(--ink);
+    font:500 15px/1.2 inherit;cursor:pointer;-webkit-appearance:none;appearance:none;
+    text-align:left}
+  .opt.sel{border-color:var(--accent);background:#f3f7fb;font-weight:600;
+    box-shadow:inset 0 0 0 1px var(--accent)}
+  .opt em{font-style:normal;font-size:11.5px;font-weight:600;color:var(--sub);
+    border:1px solid var(--hair);border-radius:99px;padding:1px 7px;background:#fff}
+  .opt.sel em{color:var(--accent);border-color:#ccd8e6}
+  .mini{font-size:12.5px;color:var(--sub);margin:14px 0 6px}
+  .rep{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .rep .arrow{color:var(--sub);flex:0 0 auto;font-size:14px}
+  .rep .rx{flex:0 0 44px;height:44px;border:1px solid var(--line);border-radius:10px;
+    background:#fff;color:var(--sub);font-size:15px;cursor:pointer}
+  .addrep{font-size:14px;font-weight:600;color:var(--accent);background:none;border:0;
+    padding:10px 0;min-height:44px;cursor:pointer}
+  .found{font-size:13.5px;color:var(--sub);line-height:1.7;background:var(--soft);
+    border-radius:10px;padding:12px 14px;margin-bottom:12px}
+  .qsubmit{display:flex;flex-direction:column;gap:8px;margin-top:22px;
+    padding-top:20px;border-top:1px solid var(--line)}
+
+  /* --- files ------------------------------------------------------------- */
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  td{padding:12px 0;border-top:1px solid var(--line);vertical-align:middle}
+  tr:first-child td{border-top:0}
+  td.fn{font-weight:500;word-break:break-all;padding-right:12px}
+  td.fs{color:var(--sub);white-space:nowrap;font-variant-numeric:tabular-nums;
+    text-align:right;padding-right:12px}
+  td.fa{white-space:nowrap;text-align:right;width:1%}
+  .lnk{display:inline-block;min-height:44px;line-height:44px;padding:0 10px;
+    font-size:14.5px;font-weight:600;background:none;border:0;color:var(--accent);
+    cursor:pointer;font-family:inherit}
+  .fmt{font-size:11.5px;color:var(--sub);border:1px solid var(--hair);border-radius:5px;
+    padding:1px 6px;margin-left:7px;text-transform:uppercase;font-weight:600}
+
+  /* --- ops --------------------------------------------------------------- */
+  .opsgrp{margin-bottom:18px}
+  .opsgrp:last-of-type{margin-bottom:0}
+  .opslabel{font-size:12.5px;color:var(--sub);margin-bottom:8px}
+  details{border-top:1px solid var(--line);margin-top:20px;padding-top:6px}
+  summary{cursor:pointer;font-size:14.5px;font-weight:600;padding:12px 0;
+    list-style:none;min-height:44px;display:flex;align-items:center}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:'›';margin-left:7px;color:var(--sub);transition:.2s}
+  details[open] summary::after{transform:rotate(90deg)}
+  pre.log{white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6;
+    background:var(--soft);border-radius:10px;padding:14px;max-height:400px;overflow:auto;
+    margin:0 0 10px;color:var(--ink)}
+</style></head><body><div class="wrap">
+
+<div class="top">
+  <a class="nav" id="back" href="/jobs">‹ 全部會議</a>
+  <a class="nav" id="navUp" href="/">📤 上傳新錄音</a>
+</div>
+
+<div id="err" class="strip hide"></div>
+<div id="ok" class="strip ok hide"></div>
+
+<div class="hero" id="hero">
+  <div class="jt"><span class="badge" id="hbadge">讀取中</span></div>
+  <h1 id="htitle">…</h1>
+  <div class="sub" id="hsub"></div>
+  <div class="prog hide" id="hprog">
+    <div class="pbar"><i id="hbar"></i></div>
+    <div class="sub" id="hstep"></div>
+  </div>
+</div>
+
+<section class="card">
+  <h2>基本資訊</h2>
+  <form id="mform">
+    <label class="first">會議主題</label>
+    <input id="m_title" placeholder="例：數位轉型第二階段規劃">
+    <div class="grid2">
+      <div><label>客戶／對象</label><input id="m_client"></div>
+      <div><label>日期</label><input id="m_date" type="date"></div>
+    </div>
+    <label>與會者（用頓號或逗號分隔）</label>
+    <input id="m_participants">
+    <div class="grid2">
+      <div><label>現場約幾人</label>
+        <select id="m_nspk">
+          <option value="-1">不確定</option>
+          <option>2</option><option>3</option><option>4</option><option>5</option>
+          <option>6</option><option>7</option><option>8</option>
+        </select></div>
+      <div><label>會議類型</label>
+        <select id="m_mtype">
+          <option value="general">一般討論會議</option>
+          <option value="client">顧問／客戶會議</option>
+          <option value="interview">訪談／研究</option>
+        </select></div>
+    </div>
+    <label>輸出內容</label>
+    <div class="opts">
+      <label class="chk" id="w_tr_l"><input type="checkbox" id="m_tr"><span>整理過的逐字稿</span></label>
+      <label class="chk" id="w_note_l"><input type="checkbox" id="m_note"><span>會議記錄</span></label>
+    </div>
+    <label>輸出檔案型態</label>
+    <div class="opts row">
+      <label class="chk" id="w_md_l"><input type="checkbox" id="f_md"><span>Markdown</span></label>
+      <label class="chk" id="w_pdf_l"><input type="checkbox" id="f_pdf"><span>PDF</span></label>
+      <label class="chk" id="w_docx_l"><input type="checkbox" id="f_docx"><span>Word</span></label>
+    </div>
+    <label>背景／專有名詞</label>
+    <textarea id="m_context" placeholder="例：這場會議會提到 ERP、對帳、SaaS，窗口是王經理"></textarea>
+    <button type="submit" class="btn primary wide" style="margin-top:20px" id="msave">儲存</button>
+  </form>
+</section>
+
+<section class="card hide" id="secQ">
+  <h2>待確認的問題</h2>
+  <div id="qfound"></div>
+  <div id="qcards"></div>
+
+  <div style="margin-top:22px;padding-top:20px;border-top:1px solid var(--line)">
+    <div class="opslabel" style="font-weight:600;color:var(--ink);font-size:13.5px">全文取代表</div>
+    <div class="mini" style="margin-top:2px">整份逐字稿與會議記錄都會套用</div>
+    <div id="reps"></div>
+    <button type="button" class="addrep" id="addrep">＋ 新增一列</button>
+  </div>
+
+  <label>自由補充</label>
+  <textarea id="qctx" placeholder="任何有助於寫好這份記錄的背景：人名、專案代號、沒講出口的結論…"></textarea>
+
+  <div class="qsubmit">
+    <button type="button" class="btn primary wide" id="qsend">送出並繼續</button>
+    <button type="button" class="btn wide" id="qskip">跳過問題，用系統推測跑</button>
+  </div>
+</section>
+
+<section class="card" id="secFiles">
+  <h2>檔案</h2>
+  <div id="files"></div>
+</section>
+
+<section class="card">
+  <h2>操作</h2>
+  <div class="opsgrp">
+    <div class="opslabel">重新產生</div>
+    <div class="btnrow">
+      <button class="btn" data-stage="scan">重跑（掃描）</button>
+      <button class="btn" data-stage="write">重跑（撰寫）</button>
+      <button class="btn" data-stage="all">全部重跑</button>
+    </div>
+  </div>
+  <div class="opsgrp">
+    <div class="opslabel">收納與空間</div>
+    <div class="btnrow">
+      <button class="btn" id="btnArch">封存</button>
+      <button class="btn" id="btnClean">清理產出</button>
+      <button class="btn danger" id="btnDel">完全刪除</button>
+    </div>
+  </div>
+  <details id="logbox">
+    <summary>執行紀錄</summary>
+    <pre class="log" id="logtxt">讀取中…</pre>
+    <button class="btn" id="logRefresh">重新整理</button>
+  </details>
+</section>
+</div>
+
+<div class="veil hide" id="veil"><div class="modal">
+  <div class="mh" id="mo_h"></div>
+  <div class="mb" id="mo_b"></div>
+  <div class="mf">
+    <button class="btn" id="mo_x">取消</button>
+    <button class="btn primary" id="mo_ok">確定</button>
+  </div>
+</div></div>
+
+<script>
+const K = new URLSearchParams(location.search).get('k') || localStorage.getItem('mk') || '';
+if (K) localStorage.setItem('mk', K);
+const $ = id => document.getElementById(id);
+const kq = p => p + (K ? (p.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(K) : '');
+const JOB = decodeURIComponent(location.pathname.replace(/^\/job\//, ''));
+const B = '/api/job/' + encodeURIComponent(JOB);
+$('back').href = kq('/jobs');
+$('navUp').href = kq('/');
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hb = b => { b = +b || 0; if (b < 1024) return b + ' B';
+  const u = ['KB','MB','GB','TB']; let i = -1;
+  do { b /= 1024; i++; } while (b >= 1024 && i < 3);
+  return b.toFixed(b < 10 ? 1 : 0) + ' ' + u[i]; };
+const dur = s => { s = Math.round(+s || 0); if (!s) return '';
+  const h = Math.floor(s/3600), m = Math.round(s%3600/60);
+  return h ? h + ' 小時 ' + m + ' 分' : Math.max(1, m) + ' 分'; };
+const MT = {general:'一般討論', client:'顧問／客戶', interview:'訪談／研究'};
+const QT = {speaker:'講者對應', term:'專有名詞', unclear:'辨識不清',
+            conflict:'前後矛盾', undecided:'未拍板'};
+const SCLS = {awaiting_answers:'s-ask', error:'s-err', done:'s-done',
+              transcribing:'s-run', scanning:'s-run', writing:'s-run'};
+const RUNNING = ['transcribing','scanning','writing'];
+const STEP = {scanning:'正在掃描逐字稿，整理待確認的問題…', writing:'正在撰寫文件…'};
+
+let D = null, Q = null, A = null, META = {};
+
+function showErr(m){ $('ok').classList.add('hide');
+  const e = $('err'); e.textContent = m; e.classList.remove('hide');
+  e.scrollIntoView({block:'nearest', behavior:'smooth'}); }
+function showOk(m){ $('err').classList.add('hide');
+  const e = $('ok'); e.textContent = m; e.classList.remove('hide');
+  setTimeout(() => e.classList.add('hide'), 4000); }
+function clearErr(){ $('err').classList.add('hide'); }
+
+async function api(path, opts){
+  const r = await fetch(kq(path), opts || {});
+  const t = await r.text();
+  let j = null; try { j = t ? JSON.parse(t) : {}; } catch(_){}
+  if (!r.ok){
+    const e = new Error((j && j.error) || ('HTTP ' + r.status));
+    e.status = r.status; throw e;
+  }
+  return j || {};
+}
+const post = (path, body) => api(path, {method:'POST',
+  headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})});
+
+/* --------------------------------------------------------------- modal --- */
+let moOk = null;
+function modal(title, html, okLabel, danger, onOk){
+  $('mo_h').textContent = title;
+  $('mo_b').innerHTML = html;
+  $('mo_ok').textContent = okLabel || '確定';
+  $('mo_ok').className = 'btn ' + (danger ? 'danger solid' : 'primary');
+  $('mo_ok').disabled = false;
+  // A modal with no action is a viewer (markdown preview): one button, not two.
+  $('mo_x').classList.toggle('hide', !onOk);
+  moOk = onOk;
+  $('veil').classList.remove('hide');
+}
+function closeModal(){ $('veil').classList.add('hide'); moOk = null; }
+$('mo_x').onclick = closeModal;
+$('veil').onclick = e => { if (e.target === $('veil')) closeModal(); };
+$('mo_ok').onclick = async () => {
+  const fn = moOk; if (!fn) return closeModal();
+  $('mo_ok').disabled = true;
+  try { await fn(); closeModal(); }
+  catch(e){ closeModal(); showErr(e.message); }
+  finally { $('mo_ok').disabled = false; }
+};
+
+/* ---------------------------------------------------------------- head --- */
+function renderHead(){
+  const badge = $('hbadge');                 // grabbed before .jt is emptied
+  badge.textContent = D.state_label || D.state || '';
+  badge.className = 'badge ' + (SCLS[D.state] || '');
+  const jt = document.querySelector('.hero .jt');
+  jt.innerHTML = '';
+  jt.appendChild(badge);
+  if (D.archived){
+    const b = document.createElement('span');
+    b.className = 'badge s-arch'; b.textContent = '已封存';
+    jt.appendChild(b);
+  }
+  if (+D.questions_open > 0){
+    const b = document.createElement('span');
+    b.className = 'badge s-ask'; b.textContent = D.questions_open + ' 題待回答';
+    jt.appendChild(b);
+  }
+  $('htitle').textContent = D.title || D.job_id;
+  document.title = (D.title || D.job_id) + ' · 會議';
+  const bits = [D.client, D.date, dur(D.duration),
+    D.num_speakers ? D.num_speakers + ' 位講者' : '',
+    MT[D.meeting_type], hb(D.size_bytes)].filter(Boolean);
+  $('hsub').textContent = bits.join(' · ');
+
+  const running = RUNNING.includes(D.state);
+  $('hprog').classList.toggle('hide', !running);
+  if (running){
+    const asr = D.state === 'transcribing';
+    $('hbar').parentNode.classList.toggle('indet', !asr);
+    $('hbar').style.width = asr ? Math.round(100 * (+D.progress || 0)) + '%' : '';
+    $('hstep').textContent = asr
+      ? (D.step_label || '轉寫中') + (D.message ? ' — ' + D.message : '')
+      : (STEP[D.state] || D.state_label || '');
+  }
+  if (D.error) showErr(String(D.error).slice(0, 400));
+  $('btnArch').textContent = D.archived ? '取消封存' : '封存';
+}
+
+/* ---------------------------------------------------------------- meta --- */
+const FCHK = [['m_tr','w_tr_l'],['m_note','w_note_l'],['f_md','w_md_l'],
+              ['f_pdf','w_pdf_l'],['f_docx','w_docx_l']];
+function syncChk(){ FCHK.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked)); }
+FCHK.forEach(([c]) => $(c).addEventListener('change', syncChk));
+
+function renderMeta(){
+  $('m_title').value = META.title || D.title || '';
+  $('m_client').value = META.client || D.client || '';
+  $('m_date').value = META.date || D.date || '';
+  $('m_participants').value = META.participants || D.participants || '';
+  $('m_nspk').value = String(META.num_speakers != null ? META.num_speakers : -1);
+  if (!$('m_nspk').value || $('m_nspk').selectedIndex < 0) $('m_nspk').value = '-1';
+  $('m_mtype').value = D.meeting_type || 'general';
+  $('m_tr').checked = !!D.want_transcript;
+  $('m_note').checked = !!D.want_note;
+  const f = D.formats || [];
+  $('f_md').checked = f.includes('md');
+  $('f_pdf').checked = f.includes('pdf');
+  $('f_docx').checked = f.includes('docx');
+  $('m_context').value = META.context || '';
+  syncChk();
+}
+
+$('mform').onsubmit = async e => {
+  e.preventDefault();
+  const formats = [];
+  if ($('f_md').checked) formats.push('md');
+  if ($('f_pdf').checked) formats.push('pdf');
+  if ($('f_docx').checked) formats.push('docx');
+  if (!$('m_note').checked && !$('m_tr').checked)
+    return showErr('請至少勾選一項輸出內容（逐字稿或會議記錄）');
+  if (!formats.length)
+    return showErr('請至少勾選一種輸出檔案型態');
+  $('msave').disabled = true;
+  try {
+    const j = await post(B + '/meta', {
+      title: $('m_title').value, client: $('m_client').value, date: $('m_date').value,
+      participants: $('m_participants').value, num_speakers: $('m_nspk').value,
+      meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
+      want_note: $('m_note').checked, formats: formats, context: $('m_context').value});
+    META = j.meta || META; D = j.summary || D;
+    clearErr(); renderHead(); showOk('已儲存');
+  } catch(err){ showErr('儲存失敗：' + err.message); }
+  finally { $('msave').disabled = false; }
+};
+
+/* ----------------------------------------------------------- questions --- */
+function renderQ(){
+  const cards = (Q && Q.cards) || [];
+  if (!cards.length){ $('secQ').classList.add('hide'); return; }
+  $('secQ').classList.remove('hide');
+
+  const prev = (A && A.cards) || {};
+  const found = (Q && Q.replacements) || [];
+  $('qfound').innerHTML = found.length
+    ? '<div class="found"><b>系統已找到的錯字修正：</b><br>' + found.map(r =>
+        esc(r.find) + ' → ' + esc(r.replace) + (r.note ? '（' + esc(r.note) + '）' : '')
+      ).join('<br>') + '</div>'
+    : '';
+
+  $('qcards').innerHTML = cards.map((c, i) => {
+    const saved = prev[c.id] || {};
+    const chosen = saved.choice != null && saved.choice !== ''
+      ? saved.choice : (c.best_guess || '');
+    const opts = (c.options || []).slice();
+    if (c.best_guess && !opts.includes(c.best_guess)) opts.unshift(c.best_guess);
+    const ev = (c.evidence || []).map(e =>
+      '<div class="evrow"><span class="ts">' + esc(e.timestamp || '') + '</span>' +
+      '<span>' + esc(e.text || '') + '</span></div>').join('');
+    return '<div class="qcard' + (saved.choice || saved.custom ? ' ans' : '') +
+      '" data-id="' + esc(c.id) + '" data-choice="' + esc(chosen) + '">' +
+      '<div class="qhead"><span class="badge">' + esc(QT[c.type] || c.type || '確認') +
+        '</span><span class="qn">' + (i + 1) + ' / ' + cards.length + '</span></div>' +
+      '<div class="qq">' + esc(c.question || '') + '</div>' +
+      (ev ? '<div class="ev">' + ev + '</div>' : '') +
+      '<div class="qopts">' + opts.map(o =>
+        '<button type="button" class="opt' + (o === chosen ? ' sel' : '') +
+        '" data-v="' + esc(o) + '">' + esc(o) +
+        (o === c.best_guess ? '<em>建議</em>' : '') + '</button>').join('') + '</div>' +
+      '<div class="mini">或自己填</div>' +
+      '<input class="custom" placeholder="輸入你的答案（會蓋過上面的選擇）" value="' +
+        esc(saved.custom || '') + '">' +
+    '</div>';
+  }).join('');
+
+  $('qcards').querySelectorAll('.opt').forEach(btn => {
+    btn.onclick = () => {
+      const card = btn.closest('.qcard');
+      card.dataset.choice = btn.dataset.v;
+      card.classList.add('ans');
+      card.querySelectorAll('.opt').forEach(b => b.classList.toggle('sel', b === btn));
+      if (/皆非|補充|其他|自己/.test(btn.dataset.v)) card.querySelector('.custom').focus();
+    };
+  });
+
+  $('reps').innerHTML = '';
+  const saved = (A && A.replacements) || [];
+  if (saved.length) saved.forEach(r => addRep(r.find, r.replace));
+  else addRep('', '');
+  $('qctx').value = (A && A.context) || '';
+}
+
+function addRep(f, t){
+  const row = document.createElement('div');
+  row.className = 'rep';
+  row.innerHTML = '<input class="rf" placeholder="原文"><span class="arrow">→</span>' +
+    '<input class="rt" placeholder="改成"><button type="button" class="rx">✕</button>';
+  row.querySelector('.rf').value = f || '';
+  row.querySelector('.rt').value = t || '';
+  row.querySelector('.rx').onclick = () => {
+    row.remove();
+    if (!$('reps').children.length) addRep('', '');
+  };
+  $('reps').appendChild(row);
+}
+$('addrep').onclick = () => addRep('', '');
+
+function collectCards(){
+  const out = {};
+  $('qcards').querySelectorAll('.qcard').forEach(el => {
+    out[el.dataset.id] = {choice: el.dataset.choice || '',
+                          custom: (el.querySelector('.custom').value || '').trim()};
+  });
+  return out;
+}
+function collectReps(){
+  return Array.from($('reps').querySelectorAll('.rep')).map(r => ({
+    find: (r.querySelector('.rf').value || '').trim(),
+    replace: (r.querySelector('.rt').value || '').trim()
+  })).filter(r => r.find);
+}
+
+async function sendAnswers(skipped){
+  $('qsend').disabled = $('qskip').disabled = true;
+  try {
+    await post(B + '/answers', skipped
+      ? {skipped: true, cards: {}, replacements: [], context: $('qctx').value}
+      : {skipped: false, cards: collectCards(), replacements: collectReps(),
+         context: $('qctx').value});
+    showOk(skipped ? '已用系統推測開始撰寫' : '已送出，開始撰寫');
+    await load();
+  } catch(e){ showErr('送出失敗：' + e.message); }
+  finally { $('qsend').disabled = $('qskip').disabled = false; }
+}
+$('qsend').onclick = () => sendAnswers(false);
+$('qskip').onclick = () => modal('跳過所有問題？',
+  '系統會直接採用每一題的建議答案開始撰寫。之後仍可以在這頁重跑。',
+  '跳過並開始撰寫', false, () => sendAnswers(true));
+
+/* --------------------------------------------------------------- files --- */
+function renderFiles(){
+  const fs = D.files || [];
+  if (!fs.length){
+    $('files').innerHTML = '<div class="sub">還沒有產出檔案。' +
+      (D.outputs_cleaned ? '（產出已清理，可用上方「重跑」重新產生）' : '') + '</div>';
+    return;
+  }
+  $('files').innerHTML = '<table>' + fs.map(f =>
+    '<tr><td class="fn">' + esc(f.name) + '<span class="fmt">' + esc(f.fmt) + '</span></td>' +
+    '<td class="fs">' + hb(f.size) + '</td><td class="fa">' +
+    (f.fmt === 'md' ? '<button class="lnk" data-prev="' + esc(f.name) + '">預覽</button>' : '') +
+    '<a class="lnk" href="' + esc(kq('/files/' + encodeURIComponent(JOB) + '/' +
+      encodeURIComponent(f.name))) + '">下載</a></td></tr>').join('') + '</table>';
+
+  $('files').querySelectorAll('[data-prev]').forEach(b => {
+    b.onclick = async () => {
+      const n = b.dataset.prev;
+      modal(n, '<div class="sub">讀取中…</div>', '關閉', false, null);
+      try {
+        const j = await api(B + '/raw/' + encodeURIComponent(n));
+        $('mo_b').innerHTML = '<pre></pre>';
+        $('mo_b').querySelector('pre').textContent = j.text || '(空白)';
+      } catch(e){ $('mo_b').innerHTML = '<div class="strip"></div>';
+        $('mo_b').querySelector('.strip').textContent = e.message; }
+    };
+  });
+}
+
+/* ----------------------------------------------------------------- ops --- */
+async function rerun(stage, force){
+  try {
+    await post(B + '/rerun', {stage: stage, force: !!force});
+    showOk('已開始重跑');
+    setTimeout(load, 600);
+  } catch(e){
+    if (e.status === 409)
+      modal('這場會議還在跑', esc(e.message), '仍要重跑', false,
+            () => rerun(stage, true));
+    else showErr('重跑失敗：' + e.message);
+  }
+}
+document.querySelectorAll('[data-stage]').forEach(b =>
+  b.onclick = () => rerun(b.dataset.stage, false));
+
+$('btnArch').onclick = async () => {
+  try { await post(B + '/archive', {archived: !D.archived});
+        showOk(D.archived ? '已取消封存' : '已封存'); await load(); }
+  catch(e){ showErr(e.message); }
+};
+
+$('btnClean').onclick = async () => {
+  try {
+    const p = await api(B + '/cleanup-preview');
+    const n = p.outputs.names || [];
+    modal('清理產出',
+      '會刪除 <b>' + n.length + '</b> 個產出檔案，釋出 <b>' + hb(p.outputs.bytes) +
+      '</b>。<br>錄音、逐字稿、會議設定都會保留，之後可以重跑重新產生。' +
+      (n.length ? '<pre style="margin-top:12px">' + esc(n.join('\n')) + '</pre>' : ''),
+      '清理', false, async () => {
+        const r = await post(B + '/clean');
+        showOk('已釋出 ' + hb(r.freed_bytes)); await load();
+      });
+  } catch(e){ showErr(e.message); }
+};
+
+$('btnDel').onclick = async () => {
+  try {
+    const p = await api(B + '/cleanup-preview');
+    modal('完全刪除這場會議',
+      '<b>這個動作無法復原。</b><br>會刪除整個資料夾，包含錄音 ' + hb(p.audio.bytes) +
+      '、逐字稿與所有產出，總共釋出 <b>' + hb(p.total.bytes) + '</b>。' +
+      '<div style="margin-top:14px;color:var(--ink)">請輸入 <b>DELETE</b> 以確認</div>' +
+      '<input id="delword" autocapitalize="characters" autocorrect="off" ' +
+      'spellcheck="false" style="margin-top:8px" placeholder="DELETE">',
+      '永久刪除', true, async () => {
+        if (($('delword') || {}).value !== 'DELETE') return;
+        await api(B, {method:'DELETE', headers:{'Content-Type':'application/json'},
+                      body: JSON.stringify({confirm: 'DELETE'})});
+        location.href = kq('/jobs');
+      });
+    // The button stays dead until the word is typed exactly.
+    $('mo_ok').disabled = true;
+    const inp = $('delword');
+    inp.oninput = () => { $('mo_ok').disabled = inp.value.trim() !== 'DELETE'; };
+    setTimeout(() => inp.focus(), 60);
+  } catch(e){ showErr(e.message); }
+};
+
+async function loadLog(){
+  try { const j = await api(B + '/log?lines=200');
+        $('logtxt').textContent = j.log || '(還沒有執行紀錄)'; }
+  catch(e){ $('logtxt').textContent = '讀取失敗：' + e.message; }
+}
+$('logbox').addEventListener('toggle', () => { if ($('logbox').open) loadLog(); });
+$('logRefresh').onclick = e => { e.preventDefault(); loadLog(); };
+
+/* ---------------------------------------------------------------- load --- */
+async function load(){
+  try {
+    const j = await api(B);
+    D = j.summary; Q = j.questions; A = j.answers; META = j.meta || {};
+    if (!D.error) clearErr();
+    renderHead(); renderMeta(); renderQ(); renderFiles();
+  } catch(e){
+    showErr(e.status === 401
+      ? '權杖無效，請用含 ?k=… 的網址開啟本頁' : '讀取失敗：' + e.message);
+  }
+}
+
+/* Background refresh keeps the badge, progress bar and file list live without
+   ever touching the form or the question cards the user is filling in. */
+async function refreshQuiet(){
+  try {
+    const j = await api(B);
+    const wasQ = !!(Q && (Q.cards || []).length);
+    D = j.summary; Q = j.questions; A = j.answers;
+    renderHead(); renderFiles();
+    if (!wasQ && Q && (Q.cards || []).length) renderQ();   // questions just arrived
+    if (wasQ && !(Q && (Q.cards || []).length)) $('secQ').classList.add('hide');
+  } catch(_){}
+}
+load();
+setInterval(refreshQuiet, 5000);
+</script></body></html>"""
+
+JOBS_PAGE = JOBS_PAGE.replace("__CSS__", CSS)
+DETAIL_PAGE = DETAIL_PAGE.replace("__CSS__", CSS)
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+def jobs_page(k: str = ""):
+    return JOBS_PAGE      # token is checked per-API-call, like the upload page
+
+
+@app.get("/job/{job_id}", response_class=HTMLResponse)
+def job_page(job_id: str, k: str = ""):
+    jd(job_id)            # 404 early rather than rendering a shell for nothing
+    return DETAIL_PAGE
+
+
+# ------------------------------------------------------------------- API ----
 @app.get("/api/jobs")
-def list_jobs(k: str = ""):
+def api_jobs(k: str = "", archived: int = 1):
     check(k)
-    out = []
-    for f in sorted(JOBS.glob("*.json"), reverse=True)[:30]:
-        j = json.loads(f.read_text())
-        sp = ARCHIVE / j["job_id"] / "status.json"
-        j["status"] = json.loads(sp.read_text()) if sp.exists() else None
-        out.append(j)
-    return out
+    return {"jobs": jobstate.all_jobs(include_archived=bool(archived))}
+
+
+@app.get("/api/job/{job_id}")
+def api_job(job_id: str, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    # The upload page polls this endpoint and reads state/progress/step_label/
+    # message/result/error straight off status.json, so those stay at the top
+    # level exactly as before; the review UI reads the nested keys.
+    status = read_json(d / "status.json") or {
+        "state": "running", "step_label": "啟動中", "progress": 0, "message": ""}
+    payload = dict(status)
+    payload["summary"] = jobstate.summary(d)
+    payload["questions"] = read_json(d / "questions.json")
+    payload["answers"] = read_json(d / "answers.json")
+    payload["meta"] = read_json(d / "meta.json") or {}
+    return JSONResponse(payload)
+
+
+# Meta fields the web form owns. Anything else already in meta.json (upload
+# bookkeeping like `_orig`, or keys a future version adds) is merged through
+# untouched.
+META_FIELDS = {"title", "client", "date", "participants", "num_speakers",
+               "meeting_type", "want_note", "want_transcript", "formats",
+               "context", "language"}
+
+
+@app.post("/api/job/{job_id}/meta")
+async def api_job_meta(job_id: str, req: Request, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "請求內容不是合法的 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "請求內容必須是物件")
+
+    meta = read_json(d / "meta.json") or {}
+    for key in META_FIELDS & set(body):
+        meta[key] = body[key]
+    meta = normalize_outputs(meta)
+    atomic_json(d / "meta.json", meta)
+    return {"ok": True, "meta": meta, "summary": jobstate.summary(d)}
+
+
+@app.post("/api/job/{job_id}/answers")
+async def api_job_answers(job_id: str, req: Request, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "請求內容不是合法的 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "請求內容必須是物件")
+
+    cards = body.get("cards") or {}
+    if not isinstance(cards, dict):
+        raise HTTPException(400, "cards 必須是物件")
+    reps = [r for r in (body.get("replacements") or [])
+            if isinstance(r, dict) and str(r.get("find") or "").strip()]
+
+    answers = {
+        "answered_at": time.time(),
+        "skipped": bool(body.get("skipped")),
+        "cards": {
+            str(cid): {"choice": str((v or {}).get("choice") or ""),
+                       "custom": str((v or {}).get("custom") or "")}
+            for cid, v in cards.items() if isinstance(v, dict)
+        },
+        "replacements": [{"find": str(r["find"]), "replace": str(r.get("replace") or "")}
+                         for r in reps],
+        "context": str(body.get("context") or ""),
+    }
+    # Written before anything can fail: the user's answers are the one thing
+    # here that cannot be recomputed.
+    atomic_json(d / "answers.json", answers)
+    require_review()
+
+    jobstate.set_state(d, "writing",
+                       "跳過問題，用系統推測" if answers["skipped"] else "已回答，開始撰寫")
+    spawn_review(d.name, d, "write")
+    return {"ok": True, "state": "writing", "answers": answers}
+
+
+RUNNING_STATES = {"scanning", "writing"}
+
+
+@app.post("/api/job/{job_id}/rerun")
+async def api_job_rerun(job_id: str, req: Request, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    stage = str((body or {}).get("stage") or "scan")
+    if stage not in ("scan", "write", "all"):
+        raise HTTPException(400, "stage 必須是 scan / write / all")
+
+    st = jobstate.load(d)
+    if st.get("state") in RUNNING_STATES and not (body or {}).get("force"):
+        raise HTTPException(409, f"這場會議正在{jobstate.STATES[st['state']][0]}，"
+                                 f"確定要中斷並重跑嗎？")
+    require_review()
+
+    arg = "scan" if stage == "all" else stage
+    jobstate.set_state(d, "scanning" if arg == "scan" else "writing",
+                       f"手動重跑 --stage {arg}")
+    spawn_review(d.name, d, arg)
+    return {"ok": True, "stage": arg}
+
+
+@app.post("/api/job/{job_id}/archive")
+async def api_job_archive(job_id: str, req: Request, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    flag = bool((body or {}).get("archived"))
+    jobstate.save(d, archived=flag)
+    return {"ok": True, "archived": flag}
+
+
+@app.get("/api/job/{job_id}/cleanup-preview")
+def api_cleanup_preview(job_id: str, k: str = ""):
+    check(k)
+    return cleanup_plan(jd(job_id))
+
+
+@app.post("/api/job/{job_id}/clean")
+def api_job_clean(job_id: str, k: str = ""):
+    check(k)
+    d = jd(job_id)
+    plan = cleanup_plan(d)
+
+    removed: list[str] = []
+    for g in jobstate.OUTPUT_GLOBS:
+        for p in sorted(d.glob(g)):
+            if not p.is_file() or is_protected(p.name):
+                continue
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except OSError:
+                pass
+    for sub in SCRATCH_DIRS:
+        sd = d / sub
+        if sd.is_dir():
+            shutil.rmtree(sd, ignore_errors=True)
+            removed.append(sub + "/")
+
+    jobstate.save(d, outputs_cleaned=True)
+    return {"ok": True, "removed": removed,
+            "freed_bytes": plan["outputs"]["bytes"],
+            "size_bytes": jobstate.dir_size(d)}
+
+
+@app.delete("/api/job/{job_id}")
+async def api_job_delete(job_id: str, req: Request, k: str = ""):
+    check(k)
+    d = jd(job_id)                     # resolved first: traversal is impossible
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    if (body or {}).get("confirm") != "DELETE":
+        raise HTTPException(400, '請在請求中帶上 {"confirm": "DELETE"}')
+
+    freed = jobstate.dir_size(d)
+    shutil.rmtree(d)
+    # The jobs/*.json sidecar only describes a folder that no longer exists.
+    sidecar = JOBS / f"{d.name}.json"
+    if sidecar.is_file():
+        sidecar.unlink()
+    return {"ok": True, "freed_bytes": freed}
+
+
+@app.get("/api/job/{job_id}/log")
+def api_job_log(job_id: str, k: str = "", lines: int = 200):
+    check(k)
+    d = jd(job_id)
+    lines = max(1, min(int(lines or 200), 2000))
+    agent = LOGS / f"{d.name}-agent.log"
+    plain = LOGS / f"{d.name}.log"
+    src = agent if agent.exists() else plain
+    return {"log": tail_file(src, lines), "source": src.name if src.exists() else ""}
+
+
+@app.get("/api/job/{job_id}/raw/{name}")
+def api_job_raw(job_id: str, name: str, k: str = ""):
+    check(k)
+    p = safe_child(jd(job_id), name)
+    if p.stat().st_size > 400_000:
+        raise HTTPException(413, "檔案太大，請直接下載")
+    return {"text": p.read_text(errors="replace"), "name": name}
+
+
+@app.get("/files/{job_id}/{name}")
+def download(job_id: str, name: str, k: str = ""):
+    check(k)
+    p = safe_child(jd(job_id), name)
+    return FileResponse(p, filename=name)
 
 
 if __name__ == "__main__":

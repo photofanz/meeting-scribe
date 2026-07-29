@@ -23,11 +23,28 @@ DEFAULTS: dict = {
     "service_label": "com.meetingscribe.uploader",
     "language": "zh",
     "notify": {
-        # `hermes send` delivers the "transcription finished" ping.
-        # Set "enabled": false on a machine with no Hermes install — the
-        # pipeline still runs, the message just goes to logs/undelivered.log.
-        "enabled": True,
-        "bin": "~/.local/bin/hermes",
+        # How this machine tells you a job moved on. Every mode is optional —
+        # with "none" the web UI is the only surface, which is the default for
+        # a fresh clone so the project depends on no other software.
+        #
+        #   none      no push at all; everything is read from /jobs
+        #   telegram  talk to the Telegram Bot API directly (zero dependencies)
+        #   command   shell out to an external notifier, e.g. `hermes send`
+        #   webhook   POST JSON + HMAC signature to your own endpoint
+        "mode": "none",
+        # Which transitions are worth a push. Deliberately short: a chatty
+        # channel gets muted, and a muted channel is the same as none.
+        "events": ["awaiting_answers", "done", "error"],
+        "telegram": {"bot_token": "", "chat_id": ""},
+        # {message} and {files} are substituted; {files} expands to one
+        # `MEDIA:/abs/path` line per deliverable.
+        "command": "",
+        "webhook": {"url": "", "secret": ""},
+        # --- legacy (pre-mode) --------------------------------------------
+        # A config.json still carrying notify.enabled/bin/target keeps working:
+        # load() maps it onto mode="command".
+        "enabled": None,
+        "bin": "",
         "target": "telegram",
     },
     "branding": {
@@ -43,15 +60,36 @@ DEFAULTS: dict = {
         "diarization_threads": 4,
     },
     "agent": {
-        # "manual" — stop after transcription and wait for a human (or a chat
-        #            agent) to say "整理這場會議".
-        # "auto"   — chain bin/agent_note.py straight after the transcript:
-        #            a local coding-agent CLI writes the documents unattended.
-        "mode": "manual",
+        # What happens once the transcript exists.
+        #
+        #   manual  stop; a human (or a chat agent) starts the write by hand
+        #   auto    scan and write back-to-back, nobody in the loop
+        #   review  scan, surface the questions in the web UI, wait for
+        #           answers, then write — the default, because those answers
+        #           are what stop the notes inventing names and numbers
+        "mode": "review",
         "backend": "claude",  # claude (Claude Code CLI) | codex (OpenAI Codex CLI)
         "bin": None,  # None => resolve `backend` on PATH
         "model": None,  # None => whatever the CLI defaults to
         "timeout_sec": 3600,
+        # Long transcripts are scanned in slices instead of one oversized
+        # prompt. ~20 minutes of Chinese speech is ~14k characters.
+        "chunk_chars": 14000,
+        "chunk_overlap_turns": 3,
+        # Concurrent CLI processes. Each is a full model session, so this is
+        # about memory and rate limits, not CPU cores.
+        "max_parallel": 3,
+        # Above this size the note is written map-reduce instead of one pass.
+        # Below it, a single pass produces a more coherent document.
+        "mapreduce_threshold_chars": 60000,
+        "max_questions": 8,
+    },
+    "retention": {
+        # Housekeeping hints surfaced in the UI. Nothing is ever deleted
+        # without an explicit click — these only decide what gets flagged.
+        "suggest_archive_days": 30,
+        "suggest_clean_days": 60,
+        "suggest_delete_days": 180,
     },
 }
 
@@ -63,6 +101,29 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
+def _migrate_notify(cfg: dict) -> dict:
+    """Map a pre-`mode` notify block onto the four-mode scheme.
+
+    Older configs said `{"enabled": true, "bin": "~/.local/bin/hermes",
+    "target": "telegram"}`. That is exactly `command` mode, so translate it
+    instead of silently dropping the user's only notification channel on
+    upgrade. An explicit `mode` in config.json always wins.
+    """
+    n = cfg.get("notify") or {}
+    if n.get("mode") and n["mode"] != DEFAULTS["notify"]["mode"]:
+        return cfg
+    if n.get("enabled") is None:
+        return cfg
+    if n["enabled"] and n.get("bin"):
+        n["mode"] = "command"
+        n.setdefault("command", "")
+        if not n["command"]:
+            n["command"] = f'{n["bin"]} send --to {n.get("target", "telegram")} {{message}}'
+    else:
+        n["mode"] = "none"
+    return cfg
+
+
 def load() -> dict:
     """Config with defaults filled in. Never raises on a malformed file."""
     path = ROOT / "config.json"
@@ -72,14 +133,23 @@ def load() -> dict:
             user = json.loads(path.read_text())
         except Exception as exc:  # noqa: BLE001 - a broken config must not brick the pipeline
             print(f"[config] ignoring malformed config.json: {exc}")
-    return _merge(DEFAULTS, user)
+    return _migrate_notify(_merge(DEFAULTS, user))
 
 
 CONFIG = load()
 
 
+def save(cfg: dict) -> None:
+    """Persist config.json. Used by bin/notify_setup.py."""
+    path = ROOT / "config.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    os.replace(tmp, path)
+
+
 def hermes_bin() -> Path:
-    return Path(os.path.expanduser(CONFIG["notify"]["bin"]))
+    """Deprecated: only still used by the legacy `command`-mode helper."""
+    return Path(os.path.expanduser(CONFIG["notify"].get("bin") or "/nonexistent"))
 
 
 if __name__ == "__main__":  # `python bin/config.py port` -> for shell scripts

@@ -4,19 +4,32 @@
     "port": "TCP port the upload server listens on. Bound to 0.0.0.0, so keep the machine on Tailscale and off the open internet.",
     "service_label": "launchd label. Also decides the plist filename: ~/Library/LaunchAgents/<service_label>.plist. Must be unique on the machine; reverse-DNS style.",
     "language": "Reserved default transcription language. The per-upload form value wins.",
-    "notify.enabled": "false = never shell out to a notifier. The pipeline still runs; the finished-message is appended to logs/undelivered.log instead.",
-    "notify.bin": "Path to the notifier CLI, called as `<bin> send --to <target> <message>`. Leading ~ is expanded. If the file is not executable the message is parked in logs/undelivered.log.",
-    "notify.target": "Channel argument passed to the notifier's --to flag.",
+
+    "notify.mode": "How this machine tells you a job moved on. 'none' (default) = no push at all; read everything at /jobs. 'telegram' = talk to the Bot API directly, no other software needed — run `python bin/notify_setup.py` to fill in the token and chat id. 'command' = shell out to a notifier you already run. 'webhook' = POST signed JSON to your own endpoint.",
+    "notify.events": "Which transitions are worth a push. Anything not listed is silent. Valid: transcribing, transcribed, scanning, awaiting_answers, writing, done, error.",
+    "notify.telegram": "bot_token from @BotFather, chat_id of the chat to post into. `python bin/notify_setup.py` discovers the chat id for you.",
+    "notify.command": "Command template for mode=command. {message} and {files} are substituted AFTER the template is split into argv, so a meeting title containing quotes or spaces can never become an extra argument. {files} expands to one `MEDIA:/abs/path` line per deliverable. If neither placeholder appears, the message is appended as the last argument.",
+    "notify.webhook": "url + secret for mode=webhook. The body is signed with HMAC-SHA256 over the exact bytes sent, in the X-MeetingScribe-Signature header as sha256=<hex>.",
+
     "branding.brand_name": "Masthead text printed at the top of every generated PDF.",
     "branding.client_footer": "Footer line on client-facing PDF/Word documents (--kind client).",
     "branding.participants_hint": "Placeholder text in the upload form's participants field.",
+
     "asr.whisper_model": "HuggingFace repo or local path for mlx-whisper. Downloaded on first transcription (~1.5 GB for large-v3-turbo). Use mlx-community/whisper-medium-mlx on a memory-tight machine.",
     "asr.diarization_threads": "ONNX threads for speaker diarization. 4 measured faster than 10 — more threads thrash.",
-    "agent.mode": "manual = stop after the transcript and wait for someone to say 整理這場會議. auto = run bin/agent_note.py right after transcription so a local coding-agent CLI writes and delivers the documents unattended.",
+
+    "agent.mode": "What happens once the transcript exists. 'review' (default) = scan the transcript, surface the questions only you can answer at /job/<id>, and write the notes after you answer. 'auto' = scan and write back to back using every best guess, nobody in the loop. 'manual' = stop at the transcript; you press the button.",
     "agent.backend": "Which CLI to drive: 'claude' (npm i -g @anthropic-ai/claude-code) or 'codex' (npm i -g @openai/codex). It must already be logged in — an unauthenticated CLI can exit 0 having written nothing.",
-    "agent.bin": "Full path to that CLI. null = look it up on PATH. launchd starts with a narrow PATH, so if auto mode reports 'not found on PATH', put the absolute path here.",
+    "agent.bin": "Full path to that CLI. null = look it up on PATH. launchd starts with a narrow PATH, so if a job reports 'not found on PATH', put the absolute path here.",
     "agent.model": "Model argument passed through to the CLI (--model / -m). null = the CLI's own default.",
-    "agent.timeout_sec": "Hard limit for one document-writing run. A 2-hour meeting takes roughly 5-15 minutes; exit code 124 in logs/<job>-agent.log means this was hit."
+    "agent.timeout_sec": "Hard limit for ONE agent invocation (one chunk, or one document-writing pass). Exit code 124 in logs/<job>-agent.log means this was hit.",
+    "agent.chunk_chars": "Transcript slice size for the scan stage. ~14000 characters is about 20 minutes of Mandarin. A turn is never split across a boundary.",
+    "agent.chunk_overlap_turns": "How many turns of the previous chunk to show as read-only context, so the reader does not misjudge a sentence that starts mid-thought.",
+    "agent.max_parallel": "Concurrent CLI processes. Each is a full model session, so this is bounded by memory and provider rate limits, not CPU cores.",
+    "agent.mapreduce_threshold_chars": "Above this transcript size the meeting note is written map-reduce (extract material per chunk, then merge) instead of in one pass. Below it, one pass produces a more coherent document.",
+    "agent.max_questions": "Hard cap on the question cards shown to you. Eight is about two minutes of clicking; beyond that people skip the whole screen, which is worse than asking less.",
+
+    "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale."
   },
 
   "port": 8765,
@@ -24,9 +37,11 @@
   "language": "zh",
 
   "notify": {
-    "enabled": true,
-    "bin": "~/.local/bin/hermes",
-    "target": "telegram"
+    "mode": "none",
+    "events": ["awaiting_answers", "done", "error"],
+    "telegram": {"bot_token": "", "chat_id": ""},
+    "command": "",
+    "webhook": {"url": "", "secret": ""}
   },
 
   "branding": {
@@ -41,10 +56,21 @@
   },
 
   "agent": {
-    "mode": "manual",
+    "mode": "review",
     "backend": "claude",
     "bin": null,
     "model": null,
-    "timeout_sec": 3600
+    "timeout_sec": 3600,
+    "chunk_chars": 14000,
+    "chunk_overlap_turns": 3,
+    "max_parallel": 3,
+    "mapreduce_threshold_chars": 60000,
+    "max_questions": 8
+  },
+
+  "retention": {
+    "suggest_archive_days": 30,
+    "suggest_clean_days": 60,
+    "suggest_delete_days": 180
   }
 }

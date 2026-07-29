@@ -80,6 +80,18 @@ def strip_leading_h1(md: str) -> tuple[str, str | None]:
     return "\n".join(lines), title
 
 
+def normalize_for_pandoc(md: str) -> str:
+    """Keep generated markdown away from Pandoc's YAML front-matter parser.
+
+    Our transcripts and notes legitimately use `---` as horizontal rules inside
+    the body. Pandoc treats a bare `---` near the top of a document as the start
+    of a YAML metadata block and aborts on the next non-YAML line. Rewriting
+    thematic breaks to the equivalent `* * *` keeps the visual output identical
+    while removing the ambiguity.
+    """
+    return re.sub(r"(?m)^-{3,}\s*$", "* * *", md)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("markdown")
@@ -98,6 +110,7 @@ def main() -> None:
 
     md = Path(a.markdown).read_text()
     md, h1 = strip_leading_h1(md)
+    md = normalize_for_pandoc(md)
     title = a.title or h1 or "會議紀錄"
     kind_label, confidential = KINDS[a.kind]
 
