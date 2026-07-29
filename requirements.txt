@@ -1,0 +1,27 @@
+# Pinned to the versions this system was benchmarked on (Apple Silicon, Python 3.12).
+# `uv pip install -r requirements.txt` resolves the transitive tree.
+#
+# Only packages actually imported by bin/*.py are listed. Everything else in
+# `uv pip list` is a transitive dependency and is left to the resolver.
+
+# ASR — Apple Metal. mlx-whisper is macOS/Apple-Silicon only.
+mlx-whisper==0.4.3
+
+# Speaker diarization — local ONNX, no HuggingFace token required.
+sherpa-onnx==1.13.4
+
+# Upload server. python-multipart backs FastAPI's UploadFile/Form.
+fastapi==0.140.13
+uvicorn[standard]==0.52.0
+python-multipart==0.0.32
+
+# Simplified -> Traditional Chinese (bin/zhtw.py imports `opencc`).
+opencc-python-reimplemented==0.1.7
+
+# make_pdf.py falls back to this when pandoc is not installed.
+markdown==3.10.2
+
+# Pulled in by mlx-whisper, but numpy is imported directly by
+# process_meeting.py and both are pinned so a resolver change cannot surprise us.
+numpy==2.4.6
+scipy==1.18.0

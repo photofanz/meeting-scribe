@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# DENY-ALL ALLOWLIST.
+#
+# This repo lives inside a working directory that also holds real, confidential
+# meeting recordings and transcripts. A conventional "ignore these paths"
+# .gitignore is one typo away from leaking a client's audio.
+#
+# So: ignore everything, then explicitly re-admit source files only.
+# If you add a new source file, add it here too or git will not see it.
+# ---------------------------------------------------------------------------
+*
+
+# --- source ---
+!.gitignore
+!README.md
+!BENCHMARK.md
+!LICENSE
+!install.sh
+!requirements.txt
+!config.example.json
+
+!bin/
+!bin/*.py
+!bin/*.sh
+bin/__pycache__/
+
+!templates/
+!templates/*.md
+!templates/*.docx
+!templates/*.template
+
+!docs/
+!docs/**
+
+# --- never, under any circumstance ---
+# (redundant with the deny-all above; kept as a second line of defence)
+archive/
+inbox/
+jobs/
+logs/
+models/
+.uploads/
+.venv/
+.token
+config.json
+*.m4a
+*.mp3
+*.wav
+*.mp4
+*.json.bak
