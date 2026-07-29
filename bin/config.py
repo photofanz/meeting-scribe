@@ -42,6 +42,17 @@ DEFAULTS: dict = {
         "whisper_model": "mlx-community/whisper-large-v3-turbo",
         "diarization_threads": 4,
     },
+    "agent": {
+        # "manual" — stop after transcription and wait for a human (or a chat
+        #            agent) to say "整理這場會議".
+        # "auto"   — chain bin/agent_note.py straight after the transcript:
+        #            a local coding-agent CLI writes the documents unattended.
+        "mode": "manual",
+        "backend": "claude",  # claude (Claude Code CLI) | codex (OpenAI Codex CLI)
+        "bin": None,  # None => resolve `backend` on PATH
+        "model": None,  # None => whatever the CLI defaults to
+        "timeout_sec": 3600,
+    },
 }
 
 

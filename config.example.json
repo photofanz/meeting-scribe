@@ -11,7 +11,12 @@
     "branding.client_footer": "Footer line on client-facing PDF/Word documents (--kind client).",
     "branding.participants_hint": "Placeholder text in the upload form's participants field.",
     "asr.whisper_model": "HuggingFace repo or local path for mlx-whisper. Downloaded on first transcription (~1.5 GB for large-v3-turbo). Use mlx-community/whisper-medium-mlx on a memory-tight machine.",
-    "asr.diarization_threads": "ONNX threads for speaker diarization. 4 measured faster than 10 — more threads thrash."
+    "asr.diarization_threads": "ONNX threads for speaker diarization. 4 measured faster than 10 — more threads thrash.",
+    "agent.mode": "manual = stop after the transcript and wait for someone to say 整理這場會議. auto = run bin/agent_note.py right after transcription so a local coding-agent CLI writes and delivers the documents unattended.",
+    "agent.backend": "Which CLI to drive: 'claude' (npm i -g @anthropic-ai/claude-code) or 'codex' (npm i -g @openai/codex). It must already be logged in — an unauthenticated CLI can exit 0 having written nothing.",
+    "agent.bin": "Full path to that CLI. null = look it up on PATH. launchd starts with a narrow PATH, so if auto mode reports 'not found on PATH', put the absolute path here.",
+    "agent.model": "Model argument passed through to the CLI (--model / -m). null = the CLI's own default.",
+    "agent.timeout_sec": "Hard limit for one document-writing run. A 2-hour meeting takes roughly 5-15 minutes; exit code 124 in logs/<job>-agent.log means this was hit."
   },
 
   "port": 8765,
@@ -33,5 +38,13 @@
   "asr": {
     "whisper_model": "mlx-community/whisper-large-v3-turbo",
     "diarization_threads": 4
+  },
+
+  "agent": {
+    "mode": "manual",
+    "backend": "claude",
+    "bin": null,
+    "model": null,
+    "timeout_sec": 3600
   }
 }

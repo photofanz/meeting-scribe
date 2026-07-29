@@ -33,7 +33,9 @@ iPhone 語音備忘錄
 └─────────────────────────────────────────┘
       │
       ▼  完成通知（唯一離開這台機器的東西）
-  AI agent（Hermes / Claude Code / 任何能讀本機檔案的）
+  文件撰寫（二選一）
+    A. 對話 agent —— 你回一句「整理這場會議」
+    B. 本機 CLI  —— claude / codex 背景自動接手，不用你在場
       │
       ▼
   清稿 → 會議記錄 → PDF / Markdown / Word → 歸檔
@@ -51,7 +53,7 @@ iPhone 語音備忘錄
 | Tailscale | 建議。沒有的話上傳頁只在區網可見，僅靠 token 保護 |
 | Google Chrome | 選用，PDF 輸出用它 headless 渲染 |
 | pandoc | 選用，Word (.docx) 輸出需要 |
-| AI agent | 選用。轉寫本身不需要；會議記錄整理需要一個能讀本機檔案的 agent |
+| AI agent | 選用。轉寫本身不需要。會議記錄需要一個 LLM：可以是對話 agent，也可以是本機的 `claude` / `codex` CLI（見 [docs/AGENT.md](docs/AGENT.md)） |
 
 首次轉寫時 mlx-whisper 會自動抓 ASR 模型（約 1.5 GB）。之後全離線。
 
@@ -100,6 +102,13 @@ cd ~/Meetings
   "asr": {
     "whisper_model": "mlx-community/whisper-large-v3-turbo",
     "diarization_threads": 4
+  },
+  "agent": {
+    "mode": "manual",
+    "backend": "claude",
+    "bin": null,
+    "model": null,
+    "timeout_sec": 3600
   }
 }
 ```
@@ -109,6 +118,10 @@ cd ~/Meetings
 **通知**：轉寫完成會呼叫 `notify.bin send --to <target> "<訊息>"`。
 預設接 [Hermes Agent](https://hermes-agent.nousresearch.com)，但任何吃這組參數的 CLI 都行。
 把 `enabled` 設 `false`，訊息會寫進 `logs/undelivered.log`，轉寫流程照跑。
+
+**文件撰寫**：`agent.mode` 設 `auto`，轉寫完成後會直接呼叫本機的 `claude` 或
+`codex` CLI 把文件寫完並推給你，全程不用你在場。設 `manual`（預設）則停在轉寫，
+等你回一句「整理這場會議」。細節見 [docs/AGENT.md](docs/AGENT.md)。
 
 ---
 
@@ -140,8 +153,17 @@ cd ~/Meetings
 
 ### 3. 等通知
 
-轉寫完成推一則訊息，列出這次要產出什麼。回覆「整理這場會議」，agent 依 `meta.json` 接手。
-會議記錄的結構規格在 `templates/NOTE_SPECS.md` —— **那份檔案就是給 agent 讀的合約**。
+轉寫完成推一則訊息，列出這次要產出什麼。
+
+- `agent.mode = "manual"`（預設）：回覆「整理這場會議」，對話 agent 依 `meta.json` 接手。
+- `agent.mode = "auto"`：本機 `claude` / `codex` CLI 自動接手，寫完直接把檔案傳給你。
+
+兩種模式共用同一份規格 `templates/NOTE_SPECS.md` —— **那份檔案就是給 agent 讀的合約**，
+所以產出的文件結構一致。手動重跑某個 job：
+
+```bash
+.venv/bin/python bin/agent_note.py latest --deliver
+```
 
 ---
 

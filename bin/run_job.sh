@@ -14,6 +14,7 @@ HERMES="$(CFG notify bin || echo "$HOME/.local/bin/hermes")"
 HERMES="${HERMES/#\~/$HOME}"
 TARGET="$(CFG notify target || echo telegram)"
 NOTIFY="$(CFG notify enabled || echo True)"
+AGENT_MODE="$(CFG agent mode || echo manual)"
 
 "$@"
 RC=$?
@@ -21,9 +22,10 @@ RC=$?
 STATUS="$OUTDIR/status.json"
 
 if [ $RC -eq 0 ] && [ -f "$STATUS" ]; then
-  MSG=$("$PY" - "$STATUS" "$JOB_ID" "$OUTDIR" <<'PYEOF'
+  MSG=$("$PY" - "$STATUS" "$JOB_ID" "$OUTDIR" "$AGENT_MODE" <<'PYEOF'
 import json, os, sys
 s = json.load(open(sys.argv[1])); jid = sys.argv[2]; outdir = sys.argv[3]
+agent_mode = sys.argv[4] if len(sys.argv) > 4 else "manual"
 r = s.get("result") or {}
 meta = {}
 mp = os.path.join(outdir, "meta.json")
@@ -60,6 +62,9 @@ if want_note:
     steps.append(note_desc)
 steps.append("歸檔")
 plan = " → ".join(steps)
+tail = (f"文件正在背景撰寫中：\n{plan}\n\n寫完會自動把檔案傳給你。"
+        if agent_mode == "auto" else
+        f"回覆「整理這場會議」，我會跑：\n{plan}")
 def hms(x):
     x = int(x or 0); return f"{x//3600:02d}:{(x%3600)//60:02d}:{x%60:02d}"
 print(f"""🎙️ 會議轉寫完成
@@ -72,8 +77,7 @@ print(f"""🎙️ 會議轉寫完成
 
 Job: `{jid}`
 
-回覆「整理這場會議」，我會跑：
-{plan}""")
+{tail}""")
 PYEOF
 )
 else
@@ -93,6 +97,17 @@ if [ "$NOTIFY" = "True" ] && [ -x "$HERMES" ]; then
     echo "$MSG" >> "$ROOT/logs/undelivered.log"
 else
   echo "$MSG" >> "$ROOT/logs/undelivered.log"
+fi
+
+# agent.mode = "auto": hand the transcript straight to a local coding-agent CLI
+# so the documents are written without anyone in the loop. A failure here is
+# logged, not fatal — the transcript is already on disk and the job can still
+# be finished by hand with `bin/agent_note.py <job_dir>`.
+if [ $RC -eq 0 ] && [ "$AGENT_MODE" = "auto" ]; then
+  "$PY" "$ROOT/bin/agent_note.py" "$OUTDIR" --deliver \
+    >> "$ROOT/logs/$JOB_ID.log" 2>&1 || \
+    echo "[run_job] agent_note.py failed for $JOB_ID (see logs/$JOB_ID-agent.log)" \
+      >> "$ROOT/logs/$JOB_ID.log"
 fi
 
 exit $RC
