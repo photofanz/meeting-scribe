@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -156,7 +158,25 @@ def dir_size(path: Path) -> int:
     return total
 
 
-def list_files(d: Path) -> list[dict]:
+def _filename_part(text: str, fallback: str, limit: int) -> str:
+    text = unicodedata.normalize("NFKC", str(text or "").strip())
+    text = re.sub(r"[\\/:*?\"<>|]+", "_", text)
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return (text or fallback)[:limit]
+
+
+def display_name(name: str, client: str = "", title: str = "", meeting_date: str = "") -> str:
+    """User-facing download name; the on-disk name stays untouched."""
+    parts = [
+        _filename_part(client, "未命名對象", 24),
+        _filename_part(title, "未命名會議", 36),
+        _filename_part(meeting_date, "未定日期", 12),
+    ]
+    return "_".join(parts + [name])
+
+
+def list_files(d: Path, client: str = "", title: str = "", meeting_date: str = "") -> list[dict]:
     """User-facing deliverables in a stable order, newest content first."""
     order = {"transcript_clean": 0, "note_general": 1, "note_client": 2,
              "note_self": 3, "note_partner": 4, "note_interview": 5,
@@ -175,6 +195,7 @@ def list_files(d: Path) -> list[dict]:
         out.append({
             "name": p.name, "stem": stem, "fmt": ext, "size": p.stat().st_size,
             "mtime": p.stat().st_mtime,
+            "display_name": display_name(p.name, client=client, title=title, meeting_date=meeting_date),
             "_k": (order.get(stem, 50), fmt_order.get(ext, 9)),
         })
     out.sort(key=lambda r: r.pop("_k"))
@@ -227,7 +248,12 @@ def summary(job_id_or_dir) -> dict:
         "size_bytes": dir_size(d),
         "audio_bytes": audio.stat().st_size if audio else 0,
         "has_audio": audio is not None,
-        "files": list_files(d),
+        "files": list_files(
+            d,
+            client=res.get("client") or meta.get("client") or "",
+            title=res.get("title") or meta.get("title") or "未命名會議",
+            meeting_date=res.get("date") or meta.get("date") or "",
+        ),
     }
 
 

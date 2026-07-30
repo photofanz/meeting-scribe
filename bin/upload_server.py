@@ -151,7 +151,7 @@ def is_protected(name: str) -> bool:
 
 # Scratch directories the review stages build. Cheap to regenerate, and they
 # are what actually holds the disk after a long job.
-SCRATCH_DIRS = (".chunks", ".review")
+SCRATCH_DIRS = (".chunks", ".review", ".export")
 
 
 def cleanup_plan(d: Path) -> dict:
@@ -622,11 +622,25 @@ CSS = r"""
   .btn:disabled{opacity:.4;cursor:default}
   .btn.wide{width:100%}
   .btnrow{display:flex;flex-wrap:wrap;gap:8px}
+  .btn.okflash{background:var(--ok);border-color:var(--ok);color:#fff}
+  .btn.busy{opacity:.7}
 
-  /* --- inline error strip ------------------------------------------------ */
+  /* --- feedback + navigation -------------------------------------------- */
   .strip{border:1px solid #eec2c6;background:#fdf3f4;color:var(--err);border-radius:10px;
     padding:11px 14px;font-size:14px;margin-bottom:16px;line-height:1.5}
+  .toast{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));
+    transform:translate(-50%, 24px);max-width:min(92vw, 560px);width:max-content;
+    box-shadow:0 12px 32px rgba(0,0,0,.12);z-index:60;opacity:0;pointer-events:none;
+    transition:opacity .2s ease, transform .2s ease;margin:0}
+  .toast.show{opacity:1;transform:translate(-50%, 0)}
   .strip.ok{border-color:#c2e0d0;background:#f2f9f5;color:var(--ok)}
+  .fab{position:fixed;right:20px;bottom:calc(18px + env(safe-area-inset-bottom));
+    width:52px;height:52px;border-radius:999px;border:1px solid var(--hair);background:#fff;
+    color:var(--accent);box-shadow:0 10px 28px rgba(0,0,0,.12);z-index:40;display:flex;
+    align-items:center;justify-content:center;font-size:22px;font-weight:700;cursor:pointer;
+    opacity:0;pointer-events:none;transform:translateY(12px);transition:.2s}
+  .fab.show{opacity:1;pointer-events:auto;transform:translateY(0)}
+  .fab:active{background:var(--soft)}
 
   /* --- forms ------------------------------------------------------------- */
   label{display:block;font-size:13px;color:var(--sub);margin:16px 0 6px;font-weight:500}
@@ -740,6 +754,7 @@ JOBS_PAGE = r"""<!doctype html>
 <div class="count" id="count"></div>
 <div class="list" id="list"></div>
 </div>
+<button class="fab" id="toTop" type="button" aria-label="回到最上面">↑</button>
 
 <script>
 const K = new URLSearchParams(location.search).get('k') || localStorage.getItem('mk') || '';
@@ -774,6 +789,10 @@ let JOBS = [], LAST = '';
 
 function showErr(m){ $('err').textContent = m; $('err').classList.remove('hide'); }
 function clearErr(){ $('err').classList.add('hide'); }
+function syncTop(){ $('toTop').classList.toggle('show', window.scrollY > 600); }
+$('toTop').onclick = () => window.scrollTo({top:0, behavior:'smooth'});
+window.addEventListener('scroll', syncTop, {passive:true});
+syncTop();
 
 function render(){
   const q = ($('q').value || '').trim().toLowerCase();
@@ -870,6 +889,13 @@ DETAIL_PAGE = r"""<!doctype html>
   .pbar>i{display:block;height:100%;background:var(--accent);transition:width .3s}
   .pbar.indet>i{width:34%;animation:slide 1.5s cubic-bezier(.4,0,.2,1) infinite}
   @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  .stack{display:flex;flex-direction:column}
+  .ord-meta{order:10}.ord-files{order:20}.ord-ops{order:30}.ord-q{order:40}
+  body.mode-awaiting .ord-q{order:15}
+  body.mode-awaiting .ord-files{order:20}
+  body.mode-awaiting .ord-meta{order:30}
+  body.mode-awaiting .ord-ops{order:40}
+  .dirty{font-size:13px;color:var(--accent);margin-top:10px}
 
   /* --- question cards ---------------------------------------------------- */
   .qcard{border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:12px}
@@ -906,6 +932,10 @@ DETAIL_PAGE = r"""<!doctype html>
     border-radius:10px;padding:12px 14px;margin-bottom:12px}
   .qsubmit{display:flex;flex-direction:column;gap:8px;margin-top:22px;
     padding-top:20px;border-top:1px solid var(--line)}
+  .carddet{padding:0;overflow:hidden}
+  .carddet>summary{padding:18px 20px;margin:0}
+  .carddet>.inside{padding:0 20px 20px}
+  .qsum{font-size:13px;color:var(--sub);font-weight:500;margin-left:8px}
 
   /* --- files ------------------------------------------------------------- */
   table{width:100%;border-collapse:collapse;font-size:14.5px}
@@ -942,7 +972,6 @@ DETAIL_PAGE = r"""<!doctype html>
 </div>
 
 <div id="err" class="strip hide"></div>
-<div id="ok" class="strip ok hide"></div>
 
 <div class="hero" id="hero">
   <div class="jt"><span class="badge" id="hbadge">讀取中</span></div>
@@ -954,7 +983,8 @@ DETAIL_PAGE = r"""<!doctype html>
   </div>
 </div>
 
-<section class="card">
+<div class="stack" id="stack">
+<section class="card ord-meta" id="secMeta">
   <h2>基本資訊</h2>
   <form id="mform">
     <label class="first">會議主題</label>
@@ -992,37 +1022,40 @@ DETAIL_PAGE = r"""<!doctype html>
     </div>
     <label>背景／專有名詞</label>
     <textarea id="m_context" placeholder="例：這場會議會提到 ERP、對帳、SaaS，窗口是王經理"></textarea>
+    <div class="dirty hide" id="mdirty">有未儲存的變更</div>
     <button type="submit" class="btn primary wide" style="margin-top:20px" id="msave">儲存</button>
   </form>
 </section>
 
-<section class="card hide" id="secQ">
-  <h2>待確認的問題</h2>
-  <div id="qfound"></div>
-  <div id="qcards"></div>
+<details class="card carddet ord-q hide" id="secQ">
+  <summary><span>待確認的問題</span><span class="qsum" id="qsum"></span></summary>
+  <div class="inside">
+    <div id="qfound"></div>
+    <div id="qcards"></div>
 
-  <div style="margin-top:22px;padding-top:20px;border-top:1px solid var(--line)">
-    <div class="opslabel" style="font-weight:600;color:var(--ink);font-size:13.5px">全文取代表</div>
-    <div class="mini" style="margin-top:2px">整份逐字稿與會議記錄都會套用</div>
-    <div id="reps"></div>
-    <button type="button" class="addrep" id="addrep">＋ 新增一列</button>
+    <div style="margin-top:22px;padding-top:20px;border-top:1px solid var(--line)">
+      <div class="opslabel" style="font-weight:600;color:var(--ink);font-size:13.5px">全文取代表</div>
+      <div class="mini" style="margin-top:2px">整份逐字稿與會議記錄都會套用</div>
+      <div id="reps"></div>
+      <button type="button" class="addrep" id="addrep">＋ 新增一列</button>
+    </div>
+
+    <label>自由補充</label>
+    <textarea id="qctx" placeholder="任何有助於寫好這份記錄的背景：人名、專案代號、沒講出口的結論…"></textarea>
+
+    <div class="qsubmit">
+      <button type="button" class="btn primary wide" id="qsend">送出並繼續</button>
+      <button type="button" class="btn wide" id="qskip">跳過問題，用系統推測跑</button>
+    </div>
   </div>
+</details>
 
-  <label>自由補充</label>
-  <textarea id="qctx" placeholder="任何有助於寫好這份記錄的背景：人名、專案代號、沒講出口的結論…"></textarea>
-
-  <div class="qsubmit">
-    <button type="button" class="btn primary wide" id="qsend">送出並繼續</button>
-    <button type="button" class="btn wide" id="qskip">跳過問題，用系統推測跑</button>
-  </div>
-</section>
-
-<section class="card" id="secFiles">
+<section class="card ord-files" id="secFiles">
   <h2>檔案</h2>
   <div id="files"></div>
 </section>
 
-<section class="card">
+<section class="card ord-ops">
   <h2>操作</h2>
   <div class="opsgrp">
     <div class="opslabel">重新產生</div>
@@ -1047,6 +1080,8 @@ DETAIL_PAGE = r"""<!doctype html>
   </details>
 </section>
 </div>
+<button class="fab" id="toTop" type="button" aria-label="回到最上面">↑</button>
+<div id="ok" class="strip ok toast hide" aria-live="polite"></div>
 
 <div class="veil hide" id="veil"><div class="modal">
   <div class="mh" id="mo_h"></div>
@@ -1085,14 +1120,52 @@ const RUNNING = ['transcribing','scanning','writing'];
 const STEP = {scanning:'正在掃描逐字稿，整理待確認的問題…', writing:'正在撰寫文件…'};
 
 let D = null, Q = null, A = null, META = {};
+let META_SNAPSHOT = '';
+let okTimer = null;
 
-function showErr(m){ $('ok').classList.add('hide');
+function metaSnapshot(){
+  return JSON.stringify({
+    title: $('m_title').value, client: $('m_client').value, date: $('m_date').value,
+    participants: $('m_participants').value, num_speakers: $('m_nspk').value,
+    meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
+    want_note: $('m_note').checked, f_md: $('f_md').checked, f_pdf: $('f_pdf').checked,
+    f_docx: $('f_docx').checked, context: $('m_context').value
+  });
+}
+function syncDirty(){
+  const dirty = META_SNAPSHOT && metaSnapshot() !== META_SNAPSHOT;
+  $('mdirty').classList.toggle('hide', !dirty);
+}
+function setBodyMode(){
+  document.body.classList.toggle('mode-awaiting', D && D.state === 'awaiting_answers');
+}
+function syncTop(){ $('toTop').classList.toggle('show', window.scrollY > 600); }
+$('toTop').onclick = () => window.scrollTo({top:0, behavior:'smooth'});
+window.addEventListener('scroll', syncTop, {passive:true});
+syncTop();
+
+function showErr(m){ $('ok').classList.add('hide'); $('ok').classList.remove('show');
   const e = $('err'); e.textContent = m; e.classList.remove('hide');
   e.scrollIntoView({block:'nearest', behavior:'smooth'}); }
 function showOk(m){ $('err').classList.add('hide');
   const e = $('ok'); e.textContent = m; e.classList.remove('hide');
-  setTimeout(() => e.classList.add('hide'), 4000); }
+  requestAnimationFrame(() => e.classList.add('show'));
+  clearTimeout(okTimer);
+  okTimer = setTimeout(() => { e.classList.remove('show'); setTimeout(() => e.classList.add('hide'), 220); }, 2200); }
 function clearErr(){ $('err').classList.add('hide'); }
+async function withBtn(id, busyText, okText, fn){
+  const b = $(id), old = b.textContent;
+  b.disabled = true; b.classList.add('busy'); b.textContent = busyText;
+  try {
+    const out = await fn();
+    b.textContent = okText; b.classList.add('okflash');
+    setTimeout(() => { b.textContent = old; b.classList.remove('okflash'); }, 1200);
+    return out;
+  } finally {
+    b.disabled = false; b.classList.remove('busy');
+    if (!b.classList.contains('okflash')) b.textContent = old;
+  }
+}
 
 async function api(path, opts){
   const r = await fetch(kq(path), opts || {});
@@ -1133,6 +1206,7 @@ $('mo_ok').onclick = async () => {
 
 /* ---------------------------------------------------------------- head --- */
 function renderHead(){
+  setBodyMode();
   const badge = $('hbadge');                 // grabbed before .jt is emptied
   badge.textContent = D.state_label || D.state || '';
   badge.className = 'badge ' + (SCLS[D.state] || '');
@@ -1174,7 +1248,9 @@ function renderHead(){
 const FCHK = [['m_tr','w_tr_l'],['m_note','w_note_l'],['f_md','w_md_l'],
               ['f_pdf','w_pdf_l'],['f_docx','w_docx_l']];
 function syncChk(){ FCHK.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked)); }
-FCHK.forEach(([c]) => $(c).addEventListener('change', syncChk));
+FCHK.forEach(([c]) => $(c).addEventListener('change', () => { syncChk(); syncDirty(); }));
+['m_title','m_client','m_date','m_participants','m_nspk','m_mtype','m_context'].forEach(id =>
+  $(id).addEventListener('input', syncDirty));
 
 function renderMeta(){
   $('m_title').value = META.title || D.title || '';
@@ -1192,6 +1268,8 @@ function renderMeta(){
   $('f_docx').checked = f.includes('docx');
   $('m_context').value = META.context || '';
   syncChk();
+  META_SNAPSHOT = metaSnapshot();
+  syncDirty();
 }
 
 $('mform').onsubmit = async e => {
@@ -1204,17 +1282,17 @@ $('mform').onsubmit = async e => {
     return showErr('請至少勾選一項輸出內容（逐字稿或會議記錄）');
   if (!formats.length)
     return showErr('請至少勾選一種輸出檔案型態');
-  $('msave').disabled = true;
   try {
-    const j = await post(B + '/meta', {
-      title: $('m_title').value, client: $('m_client').value, date: $('m_date').value,
-      participants: $('m_participants').value, num_speakers: $('m_nspk').value,
-      meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
-      want_note: $('m_note').checked, formats: formats, context: $('m_context').value});
-    META = j.meta || META; D = j.summary || D;
-    clearErr(); renderHead(); showOk('已儲存');
+    await withBtn('msave', '儲存中…', '已儲存 ✓', async () => {
+      const j = await post(B + '/meta', {
+        title: $('m_title').value, client: $('m_client').value, date: $('m_date').value,
+        participants: $('m_participants').value, num_speakers: $('m_nspk').value,
+        meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
+        want_note: $('m_note').checked, formats: formats, context: $('m_context').value});
+      META = j.meta || META; D = j.summary || D;
+      clearErr(); renderHead(); renderMeta(); renderFiles(); showOk('已儲存');
+    });
   } catch(err){ showErr('儲存失敗：' + err.message); }
-  finally { $('msave').disabled = false; }
 };
 
 /* ----------------------------------------------------------- questions --- */
@@ -1222,6 +1300,19 @@ function renderQ(){
   const cards = (Q && Q.cards) || [];
   if (!cards.length){ $('secQ').classList.add('hide'); return; }
   $('secQ').classList.remove('hide');
+  const answered = Math.min(+((D && D.questions_answered) || 0), cards.length);
+  const open = Math.max(0, cards.length - answered);
+  let qsum = '保留作為參考';
+  if (D && D.state === 'awaiting_answers')
+    qsum = open > 0 ? `還有 ${open} 題待回答，回答後才會開始撰寫` : '可直接送出並開始撰寫';
+  else if (D && (D.state === 'scanning' || D.state === 'writing'))
+    qsum = answered > 0 ? `已收到 ${answered} 題回答，系統處理中` : '系統整理中';
+  else if (D && D.state === 'error')
+    qsum = answered > 0 ? `上次已收到 ${answered} 題回答，可重跑後沿用` : '上次流程中斷，保留作為參考';
+  else if (answered > 0)
+    qsum = `已回答 ${answered} / ${cards.length} 題，保留作為參考`;
+  $('qsum').textContent = qsum;
+  $('secQ').open = !!(D && D.state === 'awaiting_answers');
 
   const prev = (A && A.cards) || {};
   const found = (Q && Q.replacements) || [];
@@ -1304,14 +1395,20 @@ function collectReps(){
 }
 
 async function sendAnswers(skipped){
+  const btnId = skipped ? 'qskip' : 'qsend';
+  const busy = skipped ? '套用推測中…' : '送出中…';
+  const done = skipped ? '已開始 ✓' : '已送出 ✓';
   $('qsend').disabled = $('qskip').disabled = true;
   try {
-    await post(B + '/answers', skipped
-      ? {skipped: true, cards: {}, replacements: [], context: $('qctx').value}
-      : {skipped: false, cards: collectCards(), replacements: collectReps(),
-         context: $('qctx').value});
+    await withBtn(btnId, busy, done, async () => {
+      await post(B + '/answers', skipped
+        ? {skipped: true, cards: {}, replacements: [], context: $('qctx').value}
+        : {skipped: false, cards: collectCards(), replacements: collectReps(),
+           context: $('qctx').value});
+    });
     showOk(skipped ? '已用系統推測開始撰寫' : '已送出，開始撰寫');
     await load();
+    window.scrollTo({top:0, behavior:'smooth'});
   } catch(e){ showErr('送出失敗：' + e.message); }
   finally { $('qsend').disabled = $('qskip').disabled = false; }
 }
@@ -1329,16 +1426,16 @@ function renderFiles(){
     return;
   }
   $('files').innerHTML = '<table>' + fs.map(f =>
-    '<tr><td class="fn">' + esc(f.name) + '<span class="fmt">' + esc(f.fmt) + '</span></td>' +
+    '<tr><td class="fn">' + esc(f.display_name || f.name) + '<span class="fmt">' + esc(f.fmt) + '</span></td>' +
     '<td class="fs">' + hb(f.size) + '</td><td class="fa">' +
-    (f.fmt === 'md' ? '<button class="lnk" data-prev="' + esc(f.name) + '">預覽</button>' : '') +
-    '<a class="lnk" href="' + esc(kq('/files/' + encodeURIComponent(JOB) + '/' +
+    (f.fmt === 'md' ? '<button class="lnk" data-prev="' + esc(f.name) + '" data-title="' + esc(f.display_name || f.name) + '">預覽</button>' : '') +
+    '<a class="lnk" download="' + esc(f.display_name || f.name) + '" href="' + esc(kq('/files/' + encodeURIComponent(JOB) + '/' +
       encodeURIComponent(f.name))) + '">下載</a></td></tr>').join('') + '</table>';
 
   $('files').querySelectorAll('[data-prev]').forEach(b => {
     b.onclick = async () => {
       const n = b.dataset.prev;
-      modal(n, '<div class="sub">讀取中…</div>', '關閉', false, null);
+      modal(b.dataset.title || n, '<div class="sub">讀取中…</div>', '關閉', false, null);
       try {
         const j = await api(B + '/raw/' + encodeURIComponent(n));
         $('mo_b').innerHTML = '<pre></pre>';
@@ -1670,8 +1767,16 @@ def api_job_raw(job_id: str, name: str, k: str = ""):
 @app.get("/files/{job_id}/{name}")
 def download(job_id: str, name: str, k: str = ""):
     check(k)
-    p = safe_child(jd(job_id), name)
-    return FileResponse(p, filename=name)
+    d = jd(job_id)
+    p = safe_child(d, name)
+    s = jobstate.summary(d)
+    disp = jobstate.display_name(
+        name,
+        client=s.get("client") or "",
+        title=s.get("title") or name,
+        meeting_date=s.get("date") or "",
+    )
+    return FileResponse(p, filename=disp)
 
 
 if __name__ == "__main__":

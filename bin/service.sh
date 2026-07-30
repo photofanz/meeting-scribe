@@ -19,7 +19,10 @@ case "${1:-}" in
   disable) launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null; launchctl disable "$DOMAIN/$LABEL"; echo "disabled (登入不再自啟)" ;;
   enable)  launchctl enable "$DOMAIN/$LABEL"; launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; echo "enabled" ;;
   status)
-    PID=$(pgrep -f upload_server.py)
+    PID=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk -F'= ' '/^\tpid = /{print $2; exit}')
+    if [ -z "$PID" ]; then
+      PID=$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)
+    fi
     echo "root:   $ROOT"
     echo "label:  $LABEL"
     echo "pid:    ${PID:-(not running)}"

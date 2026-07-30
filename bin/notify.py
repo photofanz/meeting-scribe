@@ -45,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
+import jobstate  # noqa: E402
 from config import ROOT  # noqa: E402
 
 # jobstate states + one extra: "transcribed" is not a state (ASR finishing
@@ -407,6 +408,66 @@ def _send_webhook(cfg: dict, event: str, title: str, body_text: str,
     return False, last
 
 
+def _job_dir_for(files: list[str], job_id: str | None) -> Path | None:
+    if job_id:
+        d = ROOT / "archive" / job_id
+        if d.is_dir():
+            return d
+    for f in files:
+        p = Path(f)
+        parent = p.parent
+        if (parent / "meta.json").is_file() or (parent / "status.json").is_file():
+            return parent
+    return None
+
+
+def _read_path_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _prepare_exports(files: list[str], job_id: str | None) -> list[str]:
+    if not files:
+        return []
+    job_dir = _job_dir_for(files, job_id)
+    if not job_dir:
+        return [str(Path(f).expanduser()) for f in files]
+
+    meta = _read_path_json(job_dir / "meta.json")
+    status = _read_path_json(job_dir / "status.json")
+    client = status.get("result", {}).get("client") or meta.get("client") or ""
+    title = status.get("result", {}).get("title") or meta.get("title") or job_dir.name
+    meeting_date = status.get("result", {}).get("date") or meta.get("date") or ""
+    export_dir = job_dir / ".export"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in files:
+        src = Path(raw).expanduser()
+        if not src.is_file():
+            out.append(str(src))
+            continue
+        base = jobstate.display_name(src.name, client=client, title=title, meeting_date=meeting_date)
+        alias = export_dir / base
+        stem, suffix = alias.stem, alias.suffix
+        n = 2
+        while alias.name in seen:
+            alias = export_dir / f"{stem}_{n}{suffix}"
+            n += 1
+        seen.add(alias.name)
+        try:
+            if alias.exists() or alias.is_symlink():
+                alias.unlink()
+            os.link(src, alias)
+        except OSError:
+            shutil.copy2(src, alias)
+        out.append(str(alias))
+    return out
+
+
 # -------------------------------------------------------------------- send ---
 def _dispatch(mode: str, cfg: dict, event: str, title: str, body: str,
               files: list[str], job_id: str | None, url: str | None,
@@ -425,7 +486,7 @@ def _send(event: str, title: str, body: str = "", files: list[str] | None = None
           mode: str | None = None) -> dict:
     cfg = _cfg()
     mode = mode or cfg.get("mode") or "none"
-    files = [str(f) for f in (files or [])]
+    files = _prepare_exports([str(f) for f in (files or [])], job_id)
     events = cfg.get("events") or []
 
     # `error` ignores the subscription list on purpose. A user who muted
