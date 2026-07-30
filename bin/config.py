@@ -58,6 +58,9 @@ DEFAULTS: dict = {
     "asr": {
         "whisper_model": "mlx-community/whisper-large-v3-turbo",
         "diarization_threads": 4,
+        "diarization_threshold": 0.75,
+        "diarization_max_speakers": 8,
+        "diarization_stereo_fallback": True,
     },
     "agent": {
         # What happens once the transcript exists.

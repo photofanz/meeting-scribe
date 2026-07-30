@@ -12,18 +12,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 import wave
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import CONFIG, ROOT  # noqa: E402
+from diarization import (  # noqa: E402
+    DiarizationCandidate,
+    SpkSeg,
+    build_fallback_plan,
+    choose_best_candidate,
+    compute_stats,
+    score_stats,
+    should_run_fallback,
+)
 
 MODELS = ROOT / "models"
 SEG_MODEL = MODELS / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
@@ -32,6 +40,10 @@ SEG_MODEL = MODELS / "sherpa-onnx-pyannote-segmentation-3-0" / "model.onnx"
 EMB_MODEL = MODELS / "3dspeaker_campplus_zh.onnx"
 DIAR_THREADS = CONFIG["asr"]["diarization_threads"]   # 4 beat 10 (ONNX thread thrash)
 WHISPER_MODEL = CONFIG["asr"]["whisper_model"]
+DIAR_THRESHOLD = CONFIG["asr"].get("diarization_threshold", 0.75)
+DIAR_MAX_SPEAKERS = CONFIG["asr"].get("diarization_max_speakers", 8)
+DIAR_STEREO_FALLBACK = CONFIG["asr"].get("diarization_stereo_fallback", True)
+FFMPEG_AUDIO_FILTER = "highpass=f=60,loudnorm=I=-18:TP=-2:LRA=11"
 
 
 # ----------------------------------------------------------------- status ---
@@ -107,17 +119,56 @@ def probe_duration(path: Path) -> float:
     return float(out.stdout.strip())
 
 
+def probe_audio_channels(path: Path) -> int:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=channels",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return 1
+
+
 def normalize(src: Path, dst: Path) -> float:
-    """16 kHz mono PCM wav + light loudness normalization."""
+    """16 kHz mono PCM wav + light loudness normalization for ASR."""
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
          "-i", str(src),
          "-vn", "-ac", "1", "-ar", "16000",
-         "-af", "highpass=f=60,loudnorm=I=-18:TP=-2:LRA=11",
+         "-af", FFMPEG_AUDIO_FILTER,
          "-c:a", "pcm_s16le", str(dst)],
         check=True,
     )
     return probe_duration(dst)
+
+
+def prepare_diarization_wav(src: Path, dst: Path, channel: str) -> None:
+    if channel == "mono":
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
+            "-af", FFMPEG_AUDIO_FILTER, "-c:a", "pcm_s16le", str(dst),
+        ]
+    elif channel == "left":
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src), "-vn", "-ar", "16000",
+            "-af", f"pan=mono|c0=FL,{FFMPEG_AUDIO_FILTER}",
+            "-c:a", "pcm_s16le", str(dst),
+        ]
+    elif channel == "right":
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src), "-vn", "-ar", "16000",
+            "-af", f"pan=mono|c0=FR,{FFMPEG_AUDIO_FILTER}",
+            "-c:a", "pcm_s16le", str(dst),
+        ]
+    else:
+        raise ValueError(f"unsupported channel mode: {channel}")
+    subprocess.run(cmd, check=True)
 
 
 def read_wav(path: Path) -> tuple[np.ndarray, int]:
@@ -130,15 +181,15 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
 
 
 # --------------------------------------------------------------- diarize ----
-@dataclass
-class SpkSeg:
-    start: float
-    end: float
-    speaker: int
-
-
-def diarize(wav: Path, num_speakers: int = -1, min_speakers: int = 2,
-            max_speakers: int = 8, status: Status | None = None) -> list[SpkSeg]:
+def run_sherpa_diarization(
+    wav: Path,
+    *,
+    num_clusters: int | None,
+    threshold: float | None,
+    status: Status | None = None,
+    progress_base: float = 0.12,
+    progress_span: float = 0.76,
+) -> list[SpkSeg]:
     import sherpa_onnx
 
     cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
@@ -151,15 +202,9 @@ def diarize(wav: Path, num_speakers: int = -1, min_speakers: int = 2,
         embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
             model=str(EMB_MODEL), num_threads=DIAR_THREADS
         ),
-        # Measured against a 4-speaker ground-truth set (80 turns):
-        #   threshold 0.75, auto clusters -> 4 clusters, 92% turn accuracy
-        #   num_clusters forced to 4       -> 3 clusters, 69% turn accuracy
-        # Forcing the count is actively harmful, so `num_speakers` is kept as
-        # metadata for the LLM naming step only and never constrains clustering.
-        # 0.55 (the old default) over-split: 3 clusters on a 20-min 2-speaker
-        # file and 7 on the 4-speaker file.
         clustering=sherpa_onnx.FastClusteringConfig(
-            num_clusters=-1, threshold=0.75,
+            num_clusters=-1 if num_clusters is None else num_clusters,
+            threshold=DIAR_THRESHOLD if threshold is None else threshold,
         ),
         min_duration_on=0.3,
         min_duration_off=0.5,
@@ -181,11 +226,117 @@ def diarize(wav: Path, num_speakers: int = -1, min_speakers: int = 2,
             asr = "語音辨識已完成" if getattr(status, "asr_done", False) \
                 else "語音辨識並行中"
             status.set("diarize", f"發言者切分 {frac*100:.0f}%．{asr}",
-                       progress=0.12 + 0.76 * frac)
+                       progress=progress_base + progress_span * frac)
         return 0
 
     res = sd.process(audio, callback=cb)
     return [SpkSeg(s.start, s.end, s.speaker) for s in res.sort_by_start_time()]
+
+
+def evaluate_diarization(
+    src: Path,
+    mono_wav: Path,
+    expected_speakers: int,
+    outdir: Path,
+    status: Status | None = None,
+) -> dict:
+    stereo = probe_audio_channels(src) > 1
+    expected = expected_speakers if expected_speakers > 0 else None
+    candidate_segments: dict[str, list[SpkSeg]] = {}
+    candidates: list[DiarizationCandidate] = []
+
+    baseline_segments = run_sherpa_diarization(
+        mono_wav,
+        num_clusters=None,
+        threshold=DIAR_THRESHOLD,
+        status=status,
+        progress_base=0.12,
+        progress_span=0.72,
+    )
+    baseline_stats = compute_stats(baseline_segments)
+    baseline = DiarizationCandidate(
+        candidate_id="mono-auto",
+        source="sherpa-onnx",
+        channel="mono",
+        clustering="auto",
+        requested_clusters=None,
+        threshold=DIAR_THRESHOLD,
+        stats=baseline_stats,
+        score=score_stats(baseline_stats, expected),
+        selected=False,
+    )
+    candidates.append(baseline)
+    candidate_segments[baseline.candidate_id] = baseline_segments
+
+    fallback_used = False
+    prepared: dict[str, Path] = {"mono": mono_wav}
+
+    if should_run_fallback(baseline_stats, expected, stereo and DIAR_STEREO_FALLBACK):
+        fallback_used = True
+        plans = build_fallback_plan(
+            expected_speakers,
+            stereo=stereo and DIAR_STEREO_FALLBACK,
+            max_speakers=DIAR_MAX_SPEAKERS,
+        )
+        if status is not None:
+            status.set(
+                "diarize",
+                f"基線分群 {baseline_stats.num_speakers} 群，與填寫人數不符；正在做穩健重跑校正…",
+                progress=0.86,
+            )
+        for idx, plan in enumerate(plans, start=1):
+            channel = plan["channel"]
+            if channel not in prepared:
+                prepared[channel] = outdir / f"audio_16k_{channel}.wav"
+                prepare_diarization_wav(src, prepared[channel], channel)
+            if status is not None:
+                status.set(
+                    "diarize",
+                    f"穩健重跑 {idx}/{len(plans)}：{channel} / {plan['num_clusters']} 群",
+                    progress=0.86 + 0.05 * idx / max(len(plans), 1),
+                )
+            segs = run_sherpa_diarization(
+                prepared[channel],
+                num_clusters=plan["num_clusters"],
+                threshold=plan["threshold"],
+                status=None,
+            )
+            stats = compute_stats(segs)
+            cand = DiarizationCandidate(
+                candidate_id=plan["candidate_id"],
+                source="sherpa-onnx",
+                channel=channel,
+                clustering=plan["clustering"],
+                requested_clusters=plan["num_clusters"],
+                threshold=plan["threshold"],
+                stats=stats,
+                score=score_stats(stats, expected),
+                selected=False,
+            )
+            candidates.append(cand)
+            candidate_segments[cand.candidate_id] = segs
+
+    best = choose_best_candidate(candidates, expected)
+    selected_segments = candidate_segments[best.candidate_id]
+    diagnostics = {
+        "stereo_input": stereo,
+        "fallback_used": fallback_used,
+        "selected_candidate": best.to_dict(),
+        "candidates": [
+            {**c.to_dict(), "selected": c.candidate_id == best.candidate_id}
+            for c in candidates
+        ],
+    }
+
+    for channel, path in prepared.items():
+        if channel == "mono":
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    return {"segments": selected_segments, "diagnostics": diagnostics}
 
 
 # ------------------------------------------------------------------- asr ----
@@ -376,13 +527,15 @@ def main():
         # ASR completion is folded into the message so the bar never rewinds.
         st.asr_done = False
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_spk = (pool.submit(diarize, wav, args.num_speakers, 2, 8, st)
+            f_spk = (pool.submit(evaluate_diarization, src, wav, args.num_speakers, outdir, st)
                      if not args.skip_diarize else None)
             f_asr = pool.submit(transcribe, wav, args.language,
                                 args.initial_prompt, None)
             asr = f_asr.result()
             st.asr_done = True
-            spk = f_spk.result() if f_spk else []
+            diar = f_spk.result() if f_spk else {"segments": [], "diagnostics": None}
+            spk = diar["segments"]
+            diarization_info = diar["diagnostics"]
 
         n_spk = len({s.speaker for s in spk}) if spk else 0
 
@@ -400,9 +553,12 @@ def main():
             "realtime_factor": round(duration / max(time.time() - t0, 1e-6), 1),
         }
         (outdir / "transcript.json").write_text(
-            json.dumps({"meta": meta, "segments": segments,
-                        "speaker_turns": [asdict(s) for s in spk]},
-                       ensure_ascii=False, indent=2))
+            json.dumps({
+                "meta": meta,
+                "diarization": diarization_info,
+                "segments": segments,
+                "speaker_turns": [asdict(s) for s in spk],
+            }, ensure_ascii=False, indent=2))
         (outdir / "transcript.md").write_text(to_markdown(segments, meta))
         (outdir / "transcript.txt").write_text(
             "\n".join(s["text"] for s in segments))
@@ -416,6 +572,7 @@ def main():
             "outdir": str(outdir),
             "transcript_md": str(outdir / "transcript.md"),
             "transcript_json": str(outdir / "transcript.json"),
+            "diarization": diarization_info,
             **meta,
         })
         print(json.dumps(meta, ensure_ascii=False, indent=2))

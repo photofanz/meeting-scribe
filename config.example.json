@@ -17,6 +17,9 @@
 
     "asr.whisper_model": "HuggingFace repo or local path for mlx-whisper. Downloaded on first transcription (~1.5 GB for large-v3-turbo). Use mlx-community/whisper-medium-mlx on a memory-tight machine.",
     "asr.diarization_threads": "ONNX threads for speaker diarization. 4 measured faster than 10 — more threads thrash.",
+    "asr.diarization_threshold": "Baseline sherpa auto-clustering threshold. 0.75 is the current measured default.",
+    "asr.diarization_max_speakers": "Upper bound used by deterministic fallback candidates when the uploaded form says roughly how many people were present.",
+    "asr.diarization_stereo_fallback": "When true, a bad mono baseline on stereo recordings is re-tried with left/right channel candidates before giving up.",
 
     "agent.mode": "What happens once the transcript exists. 'review' (default) = scan the transcript, surface the questions only you can answer at /job/<id>, and write the notes after you answer. 'auto' = scan and write back to back using every best guess, nobody in the loop. 'manual' = stop at the transcript; you press the button.",
     "agent.backend": "Which CLI to drive: 'claude' (npm i -g @anthropic-ai/claude-code) or 'codex' (npm i -g @openai/codex). It must already be logged in — an unauthenticated CLI can exit 0 having written nothing.",
@@ -52,7 +55,10 @@
 
   "asr": {
     "whisper_model": "mlx-community/whisper-large-v3-turbo",
-    "diarization_threads": 4
+    "diarization_threads": 4,
+    "diarization_threshold": 0.75,
+    "diarization_max_speakers": 8,
+    "diarization_stereo_fallback": true
   },
 
   "agent": {

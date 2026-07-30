@@ -29,9 +29,11 @@ iPhone 語音備忘錄
 ┌─────────────────────────────────────────┐
 │  你的 Mac                                │
 │                                          │
-│  ffmpeg 正規化 16 kHz mono               │
+│  ffmpeg 正規化 16 kHz mono（ASR）        │
 │        │                                 │
 │        ├── 聲紋分離 (sherpa-onnx, ONNX)  │
+│        │    └─ 若講者數異常：固定群數 /   │
+│        │       左右聲道 fallback 自動重跑 │
 │        └── ASR (mlx-whisper, Metal GPU)  │
 │        │                                 │
 │  合併 → 簡轉繁 → transcript.md           │
@@ -123,7 +125,10 @@ cd ~/Meetings
   },
   "asr": {
     "whisper_model": "mlx-community/whisper-large-v3-turbo",
-    "diarization_threads": 4
+    "diarization_threads": 4,
+    "diarization_threshold": 0.75,
+    "diarization_max_speakers": 8,
+    "diarization_stereo_fallback": true
   },
   "agent": {
     "mode": "review",
@@ -185,8 +190,10 @@ argv 切分**之後**才代入，所以會議標題含引號或空白也不會�
 
 ### 2. 填表
 
-最值得花時間的欄位是**「背景／專有名詞」**——客戶名、人名、產業術語餵進去，
-辨識準確率會明顯提升，清稿時也會用它統一寫法。
+最值得花時間的欄位是**「背景／專有名詞」**，第二值得的是**「現場約幾人」**。
+前者能提升術語與人名辨識；後者現在不只是 metadata，而是聲紋分群炸掉時的
+**deterministic fallback 訊號**：系統會自動拿它去重跑固定群數候選，而不是放任
+2 人會議切成 25 / 112 群。
 
 **產出選項**（選擇記在瀏覽器，下次自動帶入）
 
