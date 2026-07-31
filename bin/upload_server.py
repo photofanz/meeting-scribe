@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
 from datetime import date
 from pathlib import Path
 
@@ -31,7 +32,9 @@ import uvicorn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jobstate  # noqa: E402
-from config import CONFIG, ROOT, hermes_bin  # noqa: E402
+import lmstudio_runtime  # noqa: E402
+import config as config_mod  # noqa: E402
+from config import CONFIG, ROOT, hermes_bin, sanitize_agent_preset  # noqa: E402
 
 INBOX = ROOT / "inbox"
 JOBS = ROOT / "jobs"
@@ -93,6 +96,8 @@ def normalize_outputs(meta: dict) -> dict:
     if not meta["want_note"] and not meta["want_transcript"]:
         meta["want_note"] = True                      # never produce nothing
 
+    meta["agent_preset"] = sanitize_agent_preset(meta.get("agent_preset"))
+
     fmts = [f for f in VALID_FORMATS if f in (meta.get("formats") or [])]
     meta["formats"] = fmts or list(DEFAULT_FORMATS)
     return meta
@@ -143,6 +148,44 @@ def read_json(path: Path):
         return json.loads(path.read_text())
     except Exception:
         return None
+
+
+def lmstudio_status_payload() -> dict:
+    try:
+        return lmstudio_runtime.status()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "backend": "openai_compat",
+            "model": "",
+            "base_url": "",
+            "cleanup": lmstudio_runtime.cleanup_cfg(),
+            "activity": lmstudio_runtime.read_activity(),
+            "loaded_models": [],
+            "loaded_count": 0,
+            "available_models": [],
+            "available_count": 0,
+            "selected_model_loaded": False,
+            "active_private_jobs": [],
+            "active_count": 0,
+            "can_unload_now": False,
+            "load_error": f"{type(exc).__name__}: {exc}",
+            "list_error": f"{type(exc).__name__}: {exc}",
+            "log_path": str(lmstudio_runtime.LOG_FILE),
+        }
+
+
+def save_private_model(model_key: str) -> str:
+    key = str(model_key or "").strip()
+    if not key:
+        raise ValueError("缺少模型名稱")
+    cfg = config_mod.load()
+    agent = cfg.setdefault("agent", {})
+    profiles = agent.setdefault("profiles", {})
+    private = profiles.setdefault("private", {})
+    private["backend"] = private.get("backend") or "openai_compat"
+    private["model"] = key
+    config_mod.save(cfg)
+    return key
 
 
 def is_protected(name: str) -> bool:
@@ -289,7 +332,7 @@ PAGE = r"""<!doctype html>
     border-radius:11px;background:#fff}
 </style></head><body><div class="wrap">
 <div class="top"><h1>會議上傳</h1><a class="nav" id="navJobs" href="/jobs">全部會議 ›</a></div>
-<div class="sub">本機轉寫 · 音檔不離開這台 Mac</div>
+<div class="sub">音檔留在這台 Mac · AI 整理可選一般模式或保密模式</div>
 
 <form id="f" class="card">
   <label>選擇錄音檔</label>
@@ -298,7 +341,19 @@ PAGE = r"""<!doctype html>
     <input id="file" type="file" accept="audio/*,video/*,.m4a,.mp3,.wav,.mp4,.mov,.aac,.caf" class="hide">
   </div>
 
-  <label class="sec">1 · 輸出內容<span class="hint"> (可複選)</span></label>
+  <label class="sec">1 · AI 處理模式</label>
+  <div class="opts">
+    <label class="chk on" id="wrapAgentGeneral" onclick="setAgentPreset('general')">
+      <input type="radio" name="agentPreset" id="agentGeneral" checked>
+      <span>一般模式（預設）<small>用 Claude / Codex 整理會議記錄，適合一般日常會議</small></span>
+    </label>
+    <label class="chk" id="wrapAgentPrivate" onclick="setAgentPreset('private')">
+      <input type="radio" name="agentPreset" id="agentPrivate">
+      <span>保密模式（LM Studio）<small>把逐字稿送到你自己的 LM Studio 推論機，適合敏感內容</small></span>
+    </label>
+  </div>
+
+  <label class="sec">2 · 輸出內容<span class="hint"> (可複選)</span></label>
   <div class="opts">
     <label class="chk" id="wrapTr">
       <input type="checkbox" id="wantTranscript">
@@ -311,7 +366,7 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div id="noteOpts">
-    <label class="sec">2 · 會議類型</label>
+    <label class="sec">3 · 會議類型</label>
     <select id="mtype">
       <option value="general" selected>一般討論會議 — 1 份會議記錄（預設）</option>
       <option value="client">顧問／客戶會議 — 3 份（客戶版／內部覆盤／夥伴版）</option>
@@ -319,7 +374,7 @@ PAGE = r"""<!doctype html>
     </select>
   </div>
 
-  <label class="sec">3 · 輸出檔案型態<span class="hint"> (可複選)</span></label>
+  <label class="sec">4 · 輸出檔案型態<span class="hint"> (可複選)</span></label>
   <div class="opts">
     <label class="chk on" id="wrapPdf"><input type="checkbox" id="fmtPdf" checked>
       <span>PDF<small>排版定稿，適合外發、存檔</small></span></label>
@@ -377,7 +432,11 @@ $('date').value = new Date().toISOString().slice(0,10);
 // ---- output-option state -------------------------------------------------
 const PAIRS = [['wantNote','wrapNote'],['wantTranscript','wrapTr'],
                ['fmtPdf','wrapPdf'],['fmtMd','wrapMd'],['fmtDocx','wrapDocx']];
+const AGENT_PAIRS = [['agentGeneral','wrapAgentGeneral'],['agentPrivate','wrapAgentPrivate']];
 const FMTS = ['fmtPdf','fmtMd','fmtDocx'];
+function syncAgents(){
+  AGENT_PAIRS.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked));
+}
 function outputsValid(){
   if (!$('wantNote').checked && !$('wantTranscript').checked)
     return '請至少勾選一項輸出內容（逐字稿或會議記錄）';
@@ -387,18 +446,38 @@ function outputsValid(){
 }
 function sync(){
   PAIRS.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked));
+  syncAgents();
   $('noteOpts').classList.toggle('hide', !$('wantNote').checked);
   const msg = outputsValid();
   $('warn').textContent = msg;
   $('warn').classList.toggle('hide', !msg);
   $('go').disabled = !FILE || !!msg;
 }
-PAIRS.forEach(([c]) => $(c).addEventListener('change', sync));
+function setAgentPreset(preset){
+  $('agentPrivate').checked = preset === 'private';
+  $('agentGeneral').checked = preset !== 'private';
+  sync();
+}
+PAIRS.forEach(([c,w]) => {
+  $(c).addEventListener('change', sync);
+  $(w).addEventListener('click', e => { if (e.target !== $(c)) { $(c).click(); } });
+});
+AGENT_PAIRS.forEach(([c,w]) => {
+  $(c).addEventListener('change', sync);
+  $(w).addEventListener('click', e => {
+    if (e.target === $(c)) return;
+    setAgentPreset(c === 'agentPrivate' ? 'private' : 'general');
+  });
+});
 // remember last choice
 try{
   const saved = JSON.parse(localStorage.getItem('mopts')||'null');
-  if (saved){ PAIRS.forEach(([c])=>{ if(c in saved) $(c).checked = saved[c]; });
-              if (saved.mtype) $('mtype').value = saved.mtype; }
+  if (saved){
+    PAIRS.forEach(([c])=>{ if(c in saved) $(c).checked = saved[c]; });
+    if (saved.mtype) $('mtype').value = saved.mtype;
+    if (saved.agentPreset === 'private') $('agentPrivate').checked = true;
+    else $('agentGeneral').checked = true;
+  }
 }catch(_){}
 
 $('drop').onclick = () => $('file').click();
@@ -428,7 +507,8 @@ $('f').onsubmit = async e => {
   try{ localStorage.setItem('mopts', JSON.stringify({
     wantNote:$('wantNote').checked, wantTranscript:$('wantTranscript').checked,
     fmtPdf:$('fmtPdf').checked, fmtMd:$('fmtMd').checked,
-    fmtDocx:$('fmtDocx').checked, mtype:$('mtype').value})); }catch(_){}
+    fmtDocx:$('fmtDocx').checked, mtype:$('mtype').value,
+    agentPreset:$('agentPrivate').checked ? 'private' : 'general'})); }catch(_){}
   $('go').disabled = true; $('prog').classList.remove('hide');
   const setP = (p,t,cls) => { $('pb').style.width = (p*100).toFixed(1)+'%';
     $('st').textContent = t; $('st').className = 'status '+(cls||''); };
@@ -441,6 +521,7 @@ $('f').onsubmit = async e => {
         client:$('client').value, title:$('title').value, date:$('date').value,
         participants:$('participants').value, num_speakers:$('nspk').value,
         language:$('lang').value, context:$('context').value,
+        agent_preset:$('agentPrivate').checked ? 'private' : 'general',
         meeting_type:$('mtype').value,
         want_note:$('wantNote').checked,
         want_transcript:$('wantTranscript').checked,
@@ -721,6 +802,14 @@ JOBS_PAGE = r"""<!doctype html>
   .empty{text-align:center;color:var(--sub);font-size:14.5px;padding:52px 20px;
     border:1px dashed var(--hair);border-radius:14px;background:#fff}
   .count{font-size:13px;color:#a1a1a6;margin:0 2px 12px}
+  .admin{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:0 0 16px}
+  .admin h2{font-size:17px;margin-bottom:8px}
+  .adminmeta{font-size:13.5px;color:var(--sub);display:flex;flex-wrap:wrap;gap:4px 10px;margin:8px 0}
+  .adminline{font-size:14px;color:var(--ink);margin-top:8px;line-height:1.6}
+  .admin .btnrow{margin-top:12px}
+  .admin .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
+  .admin select{min-width:min(100%,420px);max-width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:#fff;font-size:14px;color:var(--ink)}
+  .adminhint{font-size:12.5px;color:var(--sub);margin-top:8px;line-height:1.6}
 </style></head><body><div class="wrap">
 
 <div class="top">
@@ -730,6 +819,22 @@ JOBS_PAGE = r"""<!doctype html>
 <div class="sub" style="margin-bottom:20px">本機轉寫 · 音檔不離開這台 Mac</div>
 
 <div id="err" class="strip hide"></div>
+
+<section class="admin">
+  <h2>LM Studio 管理</h2>
+  <div class="adminmeta" id="lmMeta">讀取中…</div>
+  <div class="adminline" id="lmLine1"></div>
+  <div class="adminline" id="lmLine2"></div>
+  <div class="row">
+    <select id="lmModel"></select>
+    <button class="btn" id="lmLoad">選擇並載入模型</button>
+  </div>
+  <div class="adminhint" id="lmHint">重新整理狀態時會同步抓取 LM Studio 可用模型列表。</div>
+  <div class="btnrow">
+    <button class="btn" id="lmRefresh">重新整理狀態</button>
+    <button class="btn" id="lmEject">立即釋放模型</button>
+  </div>
+</section>
 
 <div class="tools">
   <input id="q" type="search" placeholder="搜尋主題或客戶" autocomplete="off">
@@ -785,10 +890,87 @@ function stepText(j){
   return STEP[j.state] || j.state_label || '';
 }
 
-let JOBS = [], LAST = '';
+let JOBS = [], LAST = '', LM = null;
 
 function showErr(m){ $('err').textContent = m; $('err').classList.remove('hide'); }
 function clearErr(){ $('err').classList.add('hide'); }
+function ago(ts){
+  ts = +ts || 0; if (!ts) return '尚未使用';
+  const d = Math.max(0, Math.round(Date.now()/1000 - ts));
+  if (d < 60) return d + ' 秒前';
+  if (d < 3600) return Math.floor(d/60) + ' 分鐘前';
+  if (d < 86400) return Math.floor(d/3600) + ' 小時前';
+  return Math.floor(d/86400) + ' 天前';
+}
+async function withBtn(id, busyText, okText, fn){
+  const b = $(id), old = b.textContent;
+  b.disabled = true; b.textContent = busyText;
+  try {
+    const out = await fn();
+    b.textContent = okText;
+    setTimeout(() => { b.textContent = old; }, 1200);
+    return out;
+  } finally {
+    setTimeout(() => { b.disabled = false; if (b.textContent === okText) b.textContent = old; }, 0);
+  }
+}
+function renderModelOptions(){
+  const sel = $('lmModel');
+  const models = (LM && LM.available_models) || [];
+  if (!models.length){
+    sel.innerHTML = '<option value="">（目前抓不到可用模型）</option>';
+    sel.disabled = true;
+    $('lmLoad').disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  sel.innerHTML = models.map(m => {
+    const label = [m.display_name || m.key, m.params || '', m.loaded ? '已載入' : '', m.key === LM.model ? '目前預設' : '']
+      .filter(Boolean).join(' · ');
+    return '<option value="' + esc(m.key) + '">' + esc(label) + '</option>';
+  }).join('');
+  sel.value = models.some(m => m.key === LM.model) ? LM.model : models[0].key;
+  $('lmLoad').disabled = false;
+}
+function renderLM(){
+  if (!LM){
+    $('lmMeta').textContent = '讀取中…'; $('lmLine1').textContent = ''; $('lmLine2').textContent = '';
+    $('lmHint').textContent = '重新整理狀態時會同步抓取 LM Studio 可用模型列表。';
+    $('lmModel').innerHTML = '<option value="">讀取中…</option>';
+    $('lmModel').disabled = true;
+    $('lmLoad').disabled = true;
+    return;
+  }
+  const c = LM.cleanup || {};
+  const act = LM.activity || {};
+  const bits = [
+    '策略：' + (c.mode || 'idle_eject'),
+    c.mode === 'idle_eject' ? '閒置 ' + (c.idle_minutes || 15) + ' 分鐘 eject' : '',
+    '目標模型：' + (LM.model || '未設定'),
+  ].filter(Boolean);
+  $('lmMeta').innerHTML = bits.map(esc).join('<span>·</span>');
+  $('lmLine1').textContent = '最後使用：' + ago(act.ts) + (act.job_id ? ' · job ' + act.job_id : '') + (act.stage ? ' · ' + act.stage : '');
+  $('lmLine2').textContent = (LM.active_count
+    ? '目前仍有 private jobs 執行中：' + (LM.active_private_jobs || []).join('、')
+    : '目前沒有 private jobs 在跑；可手動 eject。') +
+    (LM.load_error ? '（狀態讀取警告：' + LM.load_error + '）' : '');
+  $('lmHint').textContent = (LM.available_count || 0)
+    ? '可選 LLM：' + LM.available_count + ' 個；選擇後會更新保密模式預設模型並立即嘗試載入。'
+    : '目前沒有抓到可用模型。';
+  $('lmEject').disabled = !LM.can_unload_now;
+  renderModelOptions();
+}
+async function pollLM(showInlineError=false){
+  try {
+    LM = await (await fetch(kq('/api/admin/lmstudio'))).json();
+    renderLM();
+  } catch(e){
+    if (showInlineError) showErr('LM Studio 狀態讀取失敗：' + e.message);
+    $('lmMeta').textContent = 'LM Studio 狀態讀取失敗';
+    $('lmLine1').textContent = e.message || '';
+    $('lmLine2').textContent = '';
+  }
+}
 function syncTop(){ $('toTop').classList.toggle('show', window.scrollY > 600); }
 $('toTop').onclick = () => window.scrollTo({top:0, behavior:'smooth'});
 window.addEventListener('scroll', syncTop, {passive:true});
@@ -869,8 +1051,33 @@ async function poll(){
 
 ['q','fstate','sort','arch'].forEach(id =>
   $(id).addEventListener('input', render));
+$('lmRefresh').onclick = () => pollLM(true);
+$('lmLoad').onclick = () => withBtn('lmLoad', '載入中…', '已更新 ✓', async () => {
+  const model = $('lmModel').value;
+  if (!model) throw new Error('請先選擇模型');
+  const r = await fetch(kq('/api/admin/lmstudio/select-load'), {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({model})
+  });
+  const t = await r.text();
+  let j = {}; try { j = t ? JSON.parse(t) : {}; } catch(_){ }
+  if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+  LM = j.status || LM;
+  renderLM();
+});
+$('lmEject').onclick = () => withBtn('lmEject', '釋放中…', '已送出 ✓', async () => {
+  const r = await fetch(kq('/api/admin/lmstudio/unload'), {method:'POST'});
+  const t = await r.text();
+  let j = {}; try { j = t ? JSON.parse(t) : {}; } catch(_){ }
+  if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+  LM = j.status || LM;
+  renderLM();
+});
 poll();
+pollLM();
 setInterval(poll, 5000);
+setInterval(pollLM, 15000);
 </script></body></html>"""
 
 
@@ -1020,6 +1227,12 @@ DETAIL_PAGE = r"""<!doctype html>
       <label class="chk" id="w_pdf_l"><input type="checkbox" id="f_pdf"><span>PDF</span></label>
       <label class="chk" id="w_docx_l"><input type="checkbox" id="f_docx"><span>Word</span></label>
     </div>
+    <label>AI 處理模式</label>
+    <div class="opts">
+      <label class="chk" id="a_general_l" onclick="setDetailAgentPreset('general')"><input type="radio" name="agent_preset" id="a_general"><span>一般模式（Claude / Codex）</span></label>
+      <label class="chk" id="a_private_l" onclick="setDetailAgentPreset('private')"><input type="radio" name="agent_preset" id="a_private"><span>保密模式（LM Studio）</span></label>
+    </div>
+    <div class="mini">音檔一律留在這台 Mac；保密模式只改變逐字稿後續的 LLM 整理路徑。</div>
     <label>背景／專有名詞</label>
     <textarea id="m_context" placeholder="例：這場會議會提到 ERP、對帳、SaaS，窗口是王經理"></textarea>
     <div class="dirty hide" id="mdirty">有未儲存的變更</div>
@@ -1129,7 +1342,8 @@ function metaSnapshot(){
     participants: $('m_participants').value, num_speakers: $('m_nspk').value,
     meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
     want_note: $('m_note').checked, f_md: $('f_md').checked, f_pdf: $('f_pdf').checked,
-    f_docx: $('f_docx').checked, context: $('m_context').value
+    f_docx: $('f_docx').checked, agent_preset: $('a_private').checked ? 'private' : 'general',
+    context: $('m_context').value
   });
 }
 function syncDirty(){
@@ -1247,8 +1461,28 @@ function renderHead(){
 /* ---------------------------------------------------------------- meta --- */
 const FCHK = [['m_tr','w_tr_l'],['m_note','w_note_l'],['f_md','w_md_l'],
               ['f_pdf','w_pdf_l'],['f_docx','w_docx_l']];
-function syncChk(){ FCHK.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked)); }
-FCHK.forEach(([c]) => $(c).addEventListener('change', () => { syncChk(); syncDirty(); }));
+const APRESET = [['a_general','a_general_l'],['a_private','a_private_l']];
+function setDetailAgentPreset(preset){
+  $('a_private').checked = preset === 'private';
+  $('a_general').checked = preset !== 'private';
+  syncChk();
+  syncDirty();
+}
+function syncChk(){
+  FCHK.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked));
+  APRESET.forEach(([c,w]) => $(w).classList.toggle('on', $(c).checked));
+}
+FCHK.forEach(([c,w]) => {
+  $(c).addEventListener('change', () => { syncChk(); syncDirty(); });
+  $(w).addEventListener('click', e => { if (e.target !== $(c)) { $(c).click(); } });
+});
+APRESET.forEach(([c,w]) => {
+  $(c).addEventListener('change', () => { syncChk(); syncDirty(); });
+  $(w).addEventListener('click', e => {
+    if (e.target === $(c)) return;
+    setDetailAgentPreset(c === 'a_private' ? 'private' : 'general');
+  });
+});
 ['m_title','m_client','m_date','m_participants','m_nspk','m_mtype','m_context'].forEach(id =>
   $(id).addEventListener('input', syncDirty));
 
@@ -1266,6 +1500,8 @@ function renderMeta(){
   $('f_md').checked = f.includes('md');
   $('f_pdf').checked = f.includes('pdf');
   $('f_docx').checked = f.includes('docx');
+  const preset = (META.agent_preset || D.agent_preset || 'general');
+  setDetailAgentPreset(preset);
   $('m_context').value = META.context || '';
   syncChk();
   META_SNAPSHOT = metaSnapshot();
@@ -1288,7 +1524,9 @@ $('mform').onsubmit = async e => {
         title: $('m_title').value, client: $('m_client').value, date: $('m_date').value,
         participants: $('m_participants').value, num_speakers: $('m_nspk').value,
         meeting_type: $('m_mtype').value, want_transcript: $('m_tr').checked,
-        want_note: $('m_note').checked, formats: formats, context: $('m_context').value});
+        want_note: $('m_note').checked, formats: formats,
+        agent_preset: $('a_private').checked ? 'private' : 'general',
+        context: $('m_context').value});
       META = j.meta || META; D = j.summary || D;
       clearErr(); renderHead(); renderMeta(); renderFiles(); showOk('已儲存');
     });
@@ -1559,6 +1797,78 @@ def job_page(job_id: str, k: str = ""):
 
 
 # ------------------------------------------------------------------- API ----
+@app.get("/api/admin/lmstudio")
+def api_admin_lmstudio(k: str = ""):
+    check(k)
+    return lmstudio_status_payload()
+
+
+@app.post("/api/admin/lmstudio/select-load")
+async def api_admin_lmstudio_select_load(request: Request, k: str = ""):
+    check(k)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "請提供 JSON request body")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "請求內容必須是物件")
+    model = str(body.get("model") or "").strip()
+    if not model:
+        raise HTTPException(400, "缺少 model")
+    st = lmstudio_status_payload()
+    if st.get("active_count"):
+        raise HTTPException(409, "仍有 private jobs 執行中，現在先不要切換模型")
+    available = {str(m.get("key") or "").strip(): m for m in st.get("available_models") or []}
+    if model not in available:
+        raise HTTPException(404, f"LM Studio 找不到模型：{model}")
+
+    current = str(st.get("model") or "").strip()
+    current_loaded = current and current in (st.get("loaded_models") or [])
+    target_loaded = bool(available[model].get("loaded"))
+    unload_result = None
+    try:
+        if model != current and current_loaded and st.get("can_unload_now"):
+            unload_result = lmstudio_runtime.unload_now(reason=f"switch_model:{current}->{model}")
+        if target_loaded:
+            inst = (available[model].get("loaded_instances") or [{}])[0]
+            load_result = {
+                "ok": True,
+                "skipped": True,
+                "reason": "already_loaded",
+                "instance_id": inst.get("id") if isinstance(inst, dict) else str(inst or model),
+            }
+        else:
+            load_result = lmstudio_runtime.load_model(model)
+        saved = save_private_model(model)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        hint = "；可先按『立即釋放模型』再重試" if exc.code >= 500 else ""
+        raise HTTPException(exc.code if 400 <= exc.code < 600 else 502,
+                            f"LM Studio 載入失敗：HTTP {exc.code} {raw[:240]}{hint}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"LM Studio 載入失敗：{type(exc).__name__}: {exc}")
+    return {
+        "ok": True,
+        "saved_model": saved,
+        "unload_result": unload_result,
+        "load_result": load_result,
+        "status": lmstudio_status_payload(),
+    }
+
+
+@app.post("/api/admin/lmstudio/unload")
+def api_admin_lmstudio_unload(k: str = ""):
+    check(k)
+    st = lmstudio_status_payload()
+    if st.get("active_count"):
+        raise HTTPException(409, "仍有 private jobs 執行中，現在先不卸載模型")
+    try:
+        result = lmstudio_runtime.unload_now(reason="manual_web")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"LM Studio 卸載失敗：{type(exc).__name__}: {exc}")
+    return {"ok": True, "result": result, "status": lmstudio_status_payload()}
+
+
 @app.get("/api/jobs")
 def api_jobs(k: str = "", archived: int = 1):
     check(k)
@@ -1587,7 +1897,7 @@ def api_job(job_id: str, k: str = ""):
 # untouched.
 META_FIELDS = {"title", "client", "date", "participants", "num_speakers",
                "meeting_type", "want_note", "want_transcript", "formats",
-               "context", "language"}
+               "context", "language", "agent_preset"}
 
 
 @app.post("/api/job/{job_id}/meta")

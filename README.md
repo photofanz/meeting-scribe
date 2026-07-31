@@ -41,7 +41,7 @@ iPhone 語音備忘錄
       │
       ▼
 ┌─────────────────────────────────────────┐
-│  review 階段（本機 claude / codex CLI）  │
+│  review 階段（claude / codex CLI 或 LM Studio API） │
 │                                          │
 │  掃描：切片平行讀完整份逐字稿            │
 │        → transcript_draft.md             │
@@ -74,7 +74,7 @@ exit 0。切片與提問這兩道關卡就是為了擋這件事，設計理由�
 | Tailscale | 建議。沒有的話上傳頁只在區網可見，僅靠 token 保護 |
 | Google Chrome | 選用，PDF 輸出用它 headless 渲染 |
 | pandoc | 選用，Word (.docx) 輸出需要 |
-| AI agent | 選用。轉寫本身不需要。會議記錄需要一個 LLM：可以是對話 agent，也可以是本機的 `claude` / `codex` CLI（見 [docs/AGENT.md](docs/AGENT.md)） |
+| AI agent | 選用。轉寫本身不需要。會議記錄需要一個 LLM：可以是對話 agent、本機 `claude` / `codex` CLI，或另一台機器上的 LM Studio（OpenAI-compatible API；見 [docs/AGENT.md](docs/AGENT.md)） |
 
 首次轉寫時 mlx-whisper 會自動抓 ASR 模型（約 1.5 GB）。之後全離線。
 
@@ -135,10 +135,42 @@ cd ~/Meetings
     "backend": "claude",
     "bin": null,
     "model": null,
+    "default_preset": "general",
+    "profiles": {
+      "general": {
+        "backend": "claude",
+        "bin": null,
+        "model": null
+      },
+      "private": {
+        "backend": "openai_compat",
+        "bin": null,
+        "model": "gpt-oss-120b",
+        "api": {
+          "base_url": "http://100.85.219.106:1234/v1",
+          "api_key": "lm-studio",
+          "endpoint": "chat_completions",
+          "temperature": 0.1,
+          "max_output_tokens": 16384
+        }
+      }
+    },
+    "api": {
+      "base_url": "http://127.0.0.1:1234/v1",
+      "api_key": "lm-studio",
+      "endpoint": "chat_completions",
+      "temperature": 0.1,
+      "max_output_tokens": 16384
+    },
     "timeout_sec": 3600,
     "chunk_chars": 14000,
     "max_parallel": 3,
-    "max_questions": 8
+    "max_questions": 8,
+    "private_cleanup": {
+      "mode": "idle_eject",
+      "idle_minutes": 15,
+      "unload_endpoint": "/api/v1/models/unload"
+    }
   }
 }
 ```
@@ -175,6 +207,22 @@ argv 切分**之後**才代入，所以會議標題含引號或空白也不會�
 `review` 是預設，因為那些答案正是阻止會議記錄捏造人名與數字的東西；`auto` 產出的
 文件品質較差，而且文件開頭會自己說明這件事。細節見 [docs/REVIEW.md](docs/REVIEW.md)
 與 [docs/AGENT.md](docs/AGENT.md)。
+
+**LM Studio / OpenAI-compatible backend**：現在建議直接用 UI 的兩個 preset：
+
+- **一般模式** → `agent.profiles.general`（通常是 `claude` 或 `codex`）
+- **保密模式** → `agent.profiles.private`（通常是 `openai_compat` + LM Studio）
+
+`agent.default_preset` 決定新上傳預設勾哪個；job 詳細頁也可以隨時切換。若走
+LM Studio，請填 `agent.profiles.private.api.base_url`（例如 `http://100.x.y.z:1234/v1`，
+建議走 Tailscale）、`api_key` 與 `model`（例如 `gpt-oss-120b`）。`endpoint` 可選
+`chat_completions`（相容性最廣）或 `responses`。
+
+若希望 LM Studio 用完後把模型 eject 掉，設 `agent.private_cleanup`：
+
+- `mode=keep_loaded`：模型常駐，下一次最快
+- `mode=idle_eject`：閒置 `idle_minutes` 後呼叫 `POST /api/v1/models/unload`
+- `mode=after_job`：每次 private job 完成就立刻 unload
 
 ---
 

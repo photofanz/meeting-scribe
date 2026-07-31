@@ -235,6 +235,7 @@ def summary(job_id_or_dir) -> dict:
         "num_speakers": res.get("num_speakers"),
         "expected_speakers": res.get("expected_speakers") or meta.get("num_speakers"),
         "meeting_type": meta.get("meeting_type") or "general",
+        "agent_preset": meta.get("agent_preset") or "general",
         "want_note": meta.get("want_note", True),
         "want_transcript": meta.get("want_transcript", False),
         "formats": meta.get("formats") or ["pdf", "md"],

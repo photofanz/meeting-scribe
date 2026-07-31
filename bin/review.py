@@ -52,14 +52,17 @@ import notify as notifier  # noqa: E402
 from agent_note import (  # noqa: E402
     DOC_KINDS,
     FMT_NAME,
+    backend_is_api,
+    build_api_writer_prompt,
     build_plan,
     convert,
+    invoke_backend,
+    persist_api_writer_result,
     read_json,
     resolve_bin,
 )
-from agent_note import backend_cmd as _backend_cmd  # noqa: E402
-from agent_note import run_agent as _run_agent  # noqa: E402
-from config import CONFIG, ROOT  # noqa: E402
+from config import CONFIG, ROOT, resolve_agent_config  # noqa: E402
+from lmstudio_runtime import schedule_cleanup  # noqa: E402
 
 # Every stage takes minutes and the only progress signal is these prints, which
 # the web UI tails out of logs/<job>-agent.log. Block buffering would hide all
@@ -167,7 +170,7 @@ class Job:
     """Everything the stages need to know about one job, resolved once."""
 
     def __init__(self, job_dir: Path, backend: str, model: str | None,
-                 binary: str, timeout: int):
+                 binary: str, timeout: int, acfg: dict):
         self.dir = job_dir
         self.meta = read_json(job_dir / "meta.json")
         self.result = read_json(job_dir / "status.json").get("result") or {}
@@ -176,7 +179,7 @@ class Job:
         self.work = job_dir / ".review"
         self.work.mkdir(parents=True, exist_ok=True)
         self.log = ROOT / "logs" / f"{job_dir.name}-agent.log"
-        self.acfg = CONFIG.get("agent", {})
+        self.acfg = acfg
 
     # -- fields the prompts interpolate ------------------------------------ #
     def f(self, key: str, default: str = "") -> str:
@@ -236,19 +239,32 @@ def fill(template: Path, subs: dict) -> str:
 
 def call_agent(job: Job, prompt: str, out_path: Path, label: str,
                retries: int = 1) -> tuple[dict | None, str]:
-    """Run the CLI once and read back the file it was told to write.
+    """Run one scan/material call and read back the JSON it produced.
 
-    Success is defined by the file, never by the exit code — both supported
-    CLIs can exit 0 having written nothing (not logged in) and exit non-zero
-    having written everything (a tool-permission grumble on the way out).
-    A retry gets one more shot at a malformed write before we give up on the
-    chunk; the caller degrades rather than failing the job.
+    CLI backends write the file themselves. API backends return the JSON body as
+    text and Python persists it to `out_path` before parsing, so downstream
+    logic stays identical.
     """
+    api_prompt = (
+        prompt +
+        "\n\n## API 回傳模式\n"
+        f"你沒有檔案工具時，請直接回傳原本要寫入 `{out_path}` 的 JSON 物件本體。"
+        "不要用 Markdown code fence，不要加任何前後說明文字，只回傳可被 json.loads 解析的 JSON。"
+    )
     for attempt in range(retries + 1):
         if out_path.exists():
             out_path.unlink()
-        cmd = _backend_cmd(job.backend, job.binary, prompt, job.model)
-        rc, elapsed = _run_agent(cmd, job.log, job.timeout)
+        rc, elapsed, text = invoke_backend(
+            job.backend,
+            job.binary,
+            api_prompt if backend_is_api(job.backend) else prompt,
+            job.model,
+            job.log,
+            job.timeout,
+            job.acfg,
+        )
+        if backend_is_api(job.backend) and text:
+            out_path.write_text(text)
         data = load_agent_json(out_path)
         if data is not None:
             print(f"[review] {label}: ok ({elapsed}s, rc={rc})")
@@ -314,13 +330,14 @@ def stage_scan(job: Job, deliver: bool) -> dict:
     atomic_write(job.dir / "questions.json", merged["questions_doc"])
 
     n_q = len(merged["questions_doc"]["cards"])
-    jobstate.save(job.dir, state="awaiting_answers",
-                  note=f"{n_q} 題待回答", error=None,
+    jobstate.save(job.dir, state="awaiting_answers", note=f"{n_q} 題待回答", error=None,
                   scan={"chunks": total, "failed": merged["failed"],
                         "questions": n_q, "at": time.time()})
 
     if deliver:
         notify_questions(job, merged, total)
+    if backend_is_api(job.backend):
+        schedule_cleanup(job.acfg, job_id=job.dir.name, stage="scan")
     return merged
 
 
@@ -701,6 +718,7 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
     lines.append("- `action_items.json` — 決議／待辦／風險／關鍵數字（結構化）")
     lines.append("- `INDEX.md` — 檔案清單與機密層級")
 
+    confirmed = confirmed_block(job, res)
     prompt = fill(T_WRITE, {
         "ROOT": ROOT, "JOB_DIR": job.dir, "SPEC_PATH": SPEC_PATH,
         "SOURCE_DESC": source_desc, "TRANSCRIPT_PATH": source,
@@ -713,14 +731,30 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
         # Labels are already resolved in the text, so re-warning the writer
         # about diarisation would only make it hedge names it can trust.
         "SPEAKER_WARNING": "" if res["speaker_map"] else job.speaker_warning,
-        "CONFIRMED": confirmed_block(job, res),
+        "CONFIRMED": confirmed,
         "DELIVERABLES": "\n".join(lines),
     }) + "\n" + job.user_context
 
+    if backend_is_api(job.backend):
+        prompt = build_api_writer_prompt(
+            job.dir,
+            job.meta,
+            job.result,
+            job.plan,
+            source,
+            source_desc,
+            confirmed,
+            job.user_context,
+            "" if res["speaker_map"] else job.speaker_warning,
+        )
+
     (job.work / "write_prompt.md").write_text(prompt)
-    cmd = _backend_cmd(job.backend, job.binary, prompt, job.model)
-    rc, elapsed = _run_agent(cmd, job.log, job.timeout)
+    rc, elapsed, text = invoke_backend(job.backend, job.binary, prompt, job.model, job.log, job.timeout, job.acfg)
     print(f"[review] writer exited {rc} after {elapsed}s")
+    if backend_is_api(job.backend):
+        ok, why = persist_api_writer_result(job.dir, text, job.plan["stems"])
+        if not ok:
+            raise RuntimeError(f"API writer output invalid: {why}")
 
 
 # --------------------------------------------------------------------------- #
@@ -768,6 +802,8 @@ def finish(job: Job, deliver: bool) -> dict:
 
     if deliver:
         notify_done(job, report)
+    if backend_is_api(job.backend) and report["ok"]:
+        schedule_cleanup(job.acfg, job_id=job.dir.name, stage="write")
     return report
 
 
@@ -808,7 +844,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Scan a transcript, ask, then write the notes.")
     ap.add_argument("job", help="archive/<job_id>, a job id, or 'latest'")
     ap.add_argument("--stage", choices=["scan", "write", "auto"], default="scan")
-    ap.add_argument("--backend", choices=["claude", "codex"], default=None)
+    ap.add_argument("--backend", choices=["claude", "codex", "openai_compat"], default=None)
     ap.add_argument("--bin", default=None)
     ap.add_argument("--model", default=None)
     ap.add_argument("--timeout", type=int, default=None)
@@ -817,11 +853,13 @@ def main() -> int:
                     help="keep .review/ scratch files (default: kept on failure only)")
     args = ap.parse_args()
 
-    acfg = CONFIG.get("agent", {})
+    job_dir = resolve_job_dir(args.job)
+    meta = read_json(job_dir / "meta.json") or {}
+    acfg = resolve_agent_config(meta)
     backend = args.backend or acfg.get("backend") or "claude"
     binary = resolve_bin(backend, args.bin or acfg.get("bin"))
-    job = Job(resolve_job_dir(args.job), backend, args.model or acfg.get("model"),
-              binary, args.timeout or int(acfg.get("timeout_sec") or 3600))
+    job = Job(job_dir, backend, args.model or acfg.get("model"),
+              binary, args.timeout or int(acfg.get("timeout_sec") or 3600), acfg)
 
     (ROOT / "logs").mkdir(exist_ok=True)
     print(f"[review] {job.dir.name} · stage={args.stage} · backend={backend}")

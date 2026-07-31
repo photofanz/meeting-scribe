@@ -22,15 +22,20 @@
     "asr.diarization_stereo_fallback": "When true, a bad mono baseline on stereo recordings is re-tried with left/right channel candidates before giving up.",
 
     "agent.mode": "What happens once the transcript exists. 'review' (default) = scan the transcript, surface the questions only you can answer at /job/<id>, and write the notes after you answer. 'auto' = scan and write back to back using every best guess, nobody in the loop. 'manual' = stop at the transcript; you press the button.",
-    "agent.backend": "Which CLI to drive: 'claude' (npm i -g @anthropic-ai/claude-code) or 'codex' (npm i -g @openai/codex). It must already be logged in — an unauthenticated CLI can exit 0 having written nothing.",
-    "agent.bin": "Full path to that CLI. null = look it up on PATH. launchd starts with a narrow PATH, so if a job reports 'not found on PATH', put the absolute path here.",
-    "agent.model": "Model argument passed through to the CLI (--model / -m). null = the CLI's own default.",
+    "agent.default_preset": "Which UI option is preselected for a new upload: 'general' (Claude/Codex) or 'private' (LM Studio).",
+    "agent.profiles.general": "Backend/model/bin for the UI's '一般模式'. Point this at claude or codex.",
+    "agent.profiles.private": "Backend/model/bin/api for the UI's '保密模式'. Usually backend=openai_compat with your LM Studio server over Tailscale.",
+    "agent.backend": "Legacy flat backend kept for backward compatibility. New installs should prefer agent.profiles.general / private; old configs without profiles still work.",
+    "agent.bin": "Full path to the CLI when backend=claude/codex. null = look it up on PATH. Ignored by backend=openai_compat.",
+    "agent.model": "Model argument passed through to the CLI/API. null = the backend's own default.",
+    "agent.api": "Shared OpenAI-compatible defaults. Only used when backend=openai_compat; agent.profiles.private.api overrides this. base_url should point at /v1 on your LM Studio server (for example http://100.x.y.z:1234/v1 over Tailscale). endpoint can be 'chat_completions' (broadest compatibility) or 'responses'.",
     "agent.timeout_sec": "Hard limit for ONE agent invocation (one chunk, or one document-writing pass). Exit code 124 in logs/<job>-agent.log means this was hit.",
     "agent.chunk_chars": "Transcript slice size for the scan stage. ~14000 characters is about 20 minutes of Mandarin. A turn is never split across a boundary.",
     "agent.chunk_overlap_turns": "How many turns of the previous chunk to show as read-only context, so the reader does not misjudge a sentence that starts mid-thought.",
     "agent.max_parallel": "Concurrent CLI processes. Each is a full model session, so this is bounded by memory and provider rate limits, not CPU cores.",
     "agent.mapreduce_threshold_chars": "Above this transcript size the meeting note is written map-reduce (extract material per chunk, then merge) instead of in one pass. Below it, one pass produces a more coherent document.",
     "agent.max_questions": "Hard cap on the question cards shown to you. Eight is about two minutes of clicking; beyond that people skip the whole screen, which is worse than asking less.",
+    "agent.private_cleanup": "What to do after a private-mode LM Studio call finishes. mode=keep_loaded leaves the model in RAM; idle_eject waits idle_minutes then POSTs /api/v1/models/unload; after_job unloads immediately.",
 
     "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale."
   },
@@ -66,12 +71,45 @@
     "backend": "claude",
     "bin": null,
     "model": null,
+    "default_preset": "general",
+    "profiles": {
+      "general": {
+        "backend": "claude",
+        "bin": null,
+        "model": null
+      },
+      "private": {
+        "backend": "openai_compat",
+        "bin": null,
+        "model": "gpt-oss-120b",
+        "api": {
+          "base_url": "http://100.85.219.106:1234/v1",
+          "api_key": "lm-studio",
+          "endpoint": "chat_completions",
+          "temperature": 0.1,
+          "max_output_tokens": 16384
+        }
+      }
+    },
+    "api": {
+      "base_url": "http://127.0.0.1:1234/v1",
+      "api_key": "lm-studio",
+      "endpoint": "chat_completions",
+      "temperature": 0.1,
+      "max_output_tokens": 16384
+    },
     "timeout_sec": 3600,
     "chunk_chars": 14000,
     "chunk_overlap_turns": 3,
     "max_parallel": 3,
     "mapreduce_threshold_chars": 60000,
-    "max_questions": 8
+    "max_questions": 8,
+    "private_cleanup": {
+      "mode": "idle_eject",
+      "idle_minutes": 15,
+      "unload_endpoint": "/api/v1/models/unload",
+      "allow_unload_all": false
+    }
   },
 
   "retention": {

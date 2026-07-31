@@ -71,9 +71,42 @@ DEFAULTS: dict = {
         #           answers, then write — the default, because those answers
         #           are what stop the notes inventing names and numbers
         "mode": "review",
-        "backend": "claude",  # claude (Claude Code CLI) | codex (OpenAI Codex CLI)
-        "bin": None,  # None => resolve `backend` on PATH
-        "model": None,  # None => whatever the CLI defaults to
+        # Legacy flat backend: still honoured for CLI/manual runs and as a
+        # migration source for profiles below.
+        "backend": "claude",  # claude | codex | openai_compat
+        "bin": None,  # None => resolve `backend` on PATH; ignored by openai_compat
+        "model": None,  # None => whatever the CLI/API default is
+        "default_preset": "general",  # UI default: general | private
+        "profiles": {
+            # "一般模式" in the UI. Pick one CLI backend here.
+            "general": {
+                "backend": "claude",
+                "bin": None,
+                "model": None,
+            },
+            # "保密模式" in the UI. Typically points at LM Studio over Tailscale.
+            "private": {
+                "backend": "openai_compat",
+                "bin": None,
+                "model": None,
+                "api": {
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "api_key": "lm-studio",
+                    "endpoint": "chat_completions",
+                    "temperature": 0.1,
+                    "max_output_tokens": 16384,
+                },
+            },
+        },
+        "api": {
+            # Used only when backend=openai_compat.
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key": "lm-studio",
+            # LM Studio supports both; chat_completions is the most portable.
+            "endpoint": "chat_completions",  # chat_completions | responses
+            "temperature": 0.1,
+            "max_output_tokens": 16384,
+        },
         "timeout_sec": 3600,
         # Long transcripts are scanned in slices instead of one oversized
         # prompt. ~20 minutes of Chinese speech is ~14k characters.
@@ -86,6 +119,16 @@ DEFAULTS: dict = {
         # Below it, a single pass produces a more coherent document.
         "mapreduce_threshold_chars": 60000,
         "max_questions": 8,
+        # What to do with the remote LM Studio model after a private-mode job.
+        # keep_loaded = leave it resident for fastest next request.
+        # idle_eject  = wait N idle minutes, then unload to free RAM.
+        # after_job   = unload immediately when a private-mode agent call finishes.
+        "private_cleanup": {
+            "mode": "idle_eject",
+            "idle_minutes": 15,
+            "unload_endpoint": "/api/v1/models/unload",
+            "allow_unload_all": False,
+        },
     },
     "retention": {
         # Housekeeping hints surfaced in the UI. Nothing is ever deleted
@@ -137,6 +180,71 @@ def load() -> dict:
         except Exception as exc:  # noqa: BLE001 - a broken config must not brick the pipeline
             print(f"[config] ignoring malformed config.json: {exc}")
     return _migrate_notify(_merge(DEFAULTS, user))
+
+
+def sanitize_agent_preset(value: str | None) -> str:
+    val = str(value or "").strip().lower()
+    return val if val in {"general", "private"} else "general"
+
+
+def _legacy_agent_to_profile(agent: dict, preset: str) -> dict:
+    """Best-effort compatibility for pre-profile configs.
+
+    - If the old flat backend points at claude/codex, treat it as the general
+      profile unless the user explicitly configured profiles.general.
+    - If the old flat backend points at openai_compat (or carries a custom API
+      block), treat it as the private profile unless profiles.private already
+      exists.
+    """
+    explicit = (agent.get("profiles") or {}).get(preset)
+    if explicit:
+        return explicit
+
+    backend = agent.get("backend")
+    if preset == "general" and backend in {"claude", "codex"}:
+        return {"backend": backend, "bin": agent.get("bin"), "model": agent.get("model")}
+    if preset == "private" and (
+        backend == "openai_compat" or (agent.get("api") and agent.get("api") != DEFAULTS["agent"]["api"])
+    ):
+        return {
+            "backend": "openai_compat",
+            "bin": agent.get("bin"),
+            "model": agent.get("model"),
+            "api": agent.get("api") or {},
+        }
+    return {}
+
+
+def resolve_agent_config(meta: dict | None = None, *, cfg: dict | None = None) -> dict:
+    """Resolve the effective agent config for one job.
+
+    Jobs may choose between UI presets (`general` vs `private`) via
+    `meta.json: agent_preset`. Common knobs like chunk size, timeout, and agent
+    mode stay global; backend/bin/model/api come from the selected profile.
+    """
+    cfg = cfg or CONFIG
+    agent = dict(cfg.get("agent") or {})
+    preset = sanitize_agent_preset((meta or {}).get("agent_preset") or agent.get("default_preset"))
+    defaults = DEFAULTS["agent"]
+    profile_defaults = defaults.get("profiles", {}).get(preset, {})
+    profile_user = _legacy_agent_to_profile(agent, preset)
+    profile = _merge(profile_defaults, profile_user)
+
+    out = dict(agent)
+    out["api"] = _merge(defaults.get("api", {}), agent.get("api") or {})
+    if profile.get("backend"):
+        out["backend"] = profile.get("backend")
+    if "bin" in profile:
+        out["bin"] = profile.get("bin")
+    if "model" in profile:
+        out["model"] = profile.get("model")
+    if isinstance(profile.get("api"), dict):
+        out["api"] = _merge(out["api"], profile["api"])
+    out["agent_preset"] = preset
+    out["agent_preset_label"] = (
+        "一般模式（Claude / Codex）" if preset == "general" else "保密模式（LM Studio）"
+    )
+    return out
 
 
 CONFIG = load()
