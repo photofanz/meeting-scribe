@@ -1,20 +1,20 @@
 # meeting-scribe
 
-**Local-first meeting transcription and meeting-note production for Apple Silicon Macs.**
+**A local-first meeting intelligence pipeline for Apple Silicon Macs.**
 
-`meeting-scribe` 把一場會議從**手機錄音**一路處理到**逐字稿、清稿、會議記錄、PDF / Markdown / Word 交付**，全程以你的 Mac 為主機執行。它不是雲端 SaaS，也不是單一模型 demo，而是一套可長期運轉的本機會議處理系統。
+`meeting-scribe` 將會議錄音轉化為可交付的逐字稿與正式會議文件，涵蓋**上傳、轉寫、講者分離、清稿、文件生成與交付**的完整流程，並全程以你的 Mac 為執行主機。它不是雲端 SaaS，也不是一次性的模型展示，而是一套面向真實工作流設計的本機會議處理基礎設施。
 
-## 開箱即可使用的系統能力
+## 部署後可立即啟用的能力
 
-`meeting-scribe` 並非單一用途的轉寫腳本，而是一套可直接部署、可持續運行的本機會議處理系統：
+`meeting-scribe` 不是零散工具的拼裝，而是一套可直接部署、可持續運行的本機會議處理解決方案：
 
-- **手機可用的上傳入口**：透過瀏覽器上傳錄音，支援分段上傳與自動重試
-- **本機 ASR + 講者分離管線**：Apple Silicon 上跑 `mlx-whisper` + ONNX diarization
-- **可追蹤的 job system**：每場會議都有獨立 job 資料夾、狀態檔、可重跑產物
-- **會議 review workflow**：長逐字稿先切片掃描、出問題卡、套用答案，再寫正式文件
-- **多後端 AI 整理能力**：可接 `claude`、`codex`、對話 agent，或 LM Studio / OpenAI-compatible API
-- **交付檔案產生器**：輸出 Markdown、PDF、Word，以及會議記錄與待辦事項
-- **本機部署能力**：`install.sh` + `launchd`，可作為常駐服務運行
+- **行動端可用的上傳入口**：透過瀏覽器完成大檔錄音上傳，支援分段傳輸、自動重試與穩定的長檔處理流程
+- **本機執行的轉寫與講者分離管線**：基於 Apple Silicon、`mlx-whisper` 與 ONNX diarization，兼顧速度、隱私與可控性
+- **可追蹤、可重跑的 job system**：每場會議均具備獨立狀態、產物與中間材料，便於重寫、稽核與後續交付
+- **面向長會議的 review workflow**：以切片掃描、問題卡與答案回填機制，降低長逐字稿摘要失真與關鍵資訊誤判的風險
+- **可切換的 AI 整理後端**：支援 `claude`、`codex`、對話 agent，以及 LM Studio / OpenAI-compatible API
+- **文件生成與交付能力**：可輸出逐字稿、會議記錄、待辦事項與 `Markdown / PDF / Word` 等交付格式
+- **可常駐運行的本機部署模式**：透過 `install.sh` 與 `launchd` 建立長期可維運的內部服務
 
 ---
 
@@ -22,28 +22,28 @@
 
 | 能力 | 說明 |
 |---|---|
-| **本機轉寫** | 音檔在本機完成正規化、ASR、簡轉繁，不依賴 Whisper API 或 SaaS 轉寫服務 |
-| **講者分離** | 以 `sherpa-onnx` + CAM++ zh 執行聲紋分群；支援 headcount-aware fallback |
-| **長會議處理** | 大型逐字稿可自動切片、平行掃描，避免單次 prompt silent failure |
-| **互動式清稿** | 把姓名、術語、金額、矛盾敘述整理成可點選回答的問題卡 |
-| **雙 AI 模式** | 一般模式可接 Claude / Codex；保密模式可接 LM Studio 本機模型 |
-| **可控模型卸載** | 內建 private model cleanup 策略：`keep_loaded` / `idle_eject` / `after_job` |
-| **多格式產出** | 可輸出 `transcript` / `meeting note`，格式支援 `md` / `pdf` / `docx` |
-| **可重跑、可稽核** | 保留 source、raw transcript、answers、state；可隨時重寫文件而不必重傳音檔 |
-| **通知與交付** | 支援 `none` / `telegram` / `command` / `webhook` 四種通知模式 |
+| **Local-first transcription** | 音檔在本機完成正規化、ASR、簡轉繁，不依賴 Whisper API 或第三方轉寫 SaaS |
+| **Speaker-aware processing** | 以 `sherpa-onnx` + CAM++ zh 執行聲紋分群，並支援 headcount-aware fallback |
+| **Long-meeting reliability** | 大型逐字稿可自動切片、平行掃描，避免單次 prompt 對長內容的靜默失敗 |
+| **Interactive review** | 將姓名、術語、金額與矛盾敘述整理成可點選回答的問題卡，降低錯誤進入正式文件 |
+| **Dual AI operating modes** | 一般模式可接 Claude / Codex；保密模式可接 LM Studio 本機模型 |
+| **Controlled model lifecycle** | 內建 private model cleanup 策略：`keep_loaded` / `idle_eject` / `after_job` |
+| **Multi-format deliverables** | 可輸出 `transcript` / `meeting note`，格式支援 `md` / `pdf` / `docx` |
+| **Replayability and auditability** | 保留 source、raw transcript、answers、state，可隨時重寫文件而不必重傳音檔 |
+| **Notification and delivery integration** | 支援 `none` / `telegram` / `command` / `webhook` 四種通知模式 |
 
 ---
 
 ## 產品定位
 
-`meeting-scribe` 適合這些情境：
+`meeting-scribe` 面向需要在**隱私、準確性與可交付性**之間取得平衡的工作場景：
 
-- **顧問 / 業務 / PM / Founder**：需要把長會議快速整理成可發出的正式記錄
-- **重視隱私的團隊**：不想把客戶會議、訪談內容送到第三方雲端 ASR / note service
-- **Apple Silicon 工作站**：希望用一台常駐的 Mac 當內部會議處理節點
-- **長會議與高風險內容**：不能接受模型只讀前半段就自信產出摘要的情境
+- **顧問、業務、PM 與管理者**：需要將長會議快速整理為可發出的正式記錄與後續行動項目
+- **重視隱私與資料邊界的團隊**：不希望將客戶會議、訪談內容或內部討論送往第三方雲端服務
+- **以 Apple Silicon 為核心的內部工作站**：希望用一台常駐 Mac 建立穩定的會議處理節點
+- **長會議與高風險內容場景**：無法接受模型只讀前半段內容，就產出看似完整但事實不全的摘要
 
-它不是錄音硬體，也不是公有雲協作平台；它是**本機會議處理基礎設施**。
+它不是錄音硬體，也不是公有雲協作平台；它更接近一個可部署於內部環境的**本機會議處理層**。
 
 ---
 
