@@ -127,6 +127,24 @@ def _loaded_model_ids(acfg: dict | None = None) -> list[str]:
     return ids
 
 
+def _model_instances(model_key: str, acfg: dict | None = None) -> list[str]:
+    key = str(model_key or "").strip()
+    if not key:
+        return []
+    ids: list[str] = []
+    for item in list_models(acfg):
+        if str(item.get("key") or "").strip() != key:
+            continue
+        for inst in item.get("loaded_instances") or []:
+            if isinstance(inst, dict):
+                val = str(inst.get("id") or key).strip()
+            else:
+                val = str(inst or key).strip()
+            if val and val not in ids:
+                ids.append(val)
+    return ids
+
+
 def list_models(acfg: dict | None = None) -> list[dict]:
     root = _api_root(acfg)
     req = urllib.request.Request(root + "/api/v1/models", headers=_auth_headers(acfg))
@@ -202,18 +220,16 @@ def unload_now(acfg: dict | None = None, *, reason: str = "") -> dict:
     root = _api_root(acfg)
     endpoint = cfg["unload_endpoint"]
     configured_model = str(acfg.get("model") or "").strip()
-    loaded = _loaded_model_ids(acfg)
-    candidates: list[str] = []
-    if configured_model:
-        candidates.append(configured_model)
-    candidates.extend(loaded)
-    deduped: list[str] = []
-    for val in candidates:
-        if val and val not in deduped:
-            deduped.append(val)
+    target_instances = _model_instances(configured_model, acfg)
 
-    last_err = "no candidate model ids"
-    for instance_id in deduped:
+    candidates: list[str] = []
+    if target_instances:
+        candidates.extend(target_instances)
+    elif configured_model and not _loaded_model_ids(acfg):
+        candidates.append(configured_model)
+
+    last_err = "configured model is not currently loaded"
+    for instance_id in candidates:
         payload = json.dumps({"instance_id": instance_id}).encode("utf-8")
         req = urllib.request.Request(root + endpoint, data=payload,
                                      headers=_auth_headers(acfg), method="POST")
@@ -230,7 +246,8 @@ def unload_now(acfg: dict | None = None, *, reason: str = "") -> dict:
         except Exception as exc:  # noqa: BLE001
             last_err = f"{instance_id}: {type(exc).__name__}: {exc}"
 
-    if cfg.get("allow_unload_all") and len(loaded) == 1:
+    loaded = _loaded_model_ids(acfg)
+    if cfg.get("allow_unload_all") and len(loaded) == 1 and configured_model and configured_model == loaded[0]:
         instance_id = loaded[0]
         payload = json.dumps({"instance_id": instance_id}).encode("utf-8")
         req = urllib.request.Request(root + endpoint, data=payload,
@@ -305,6 +322,16 @@ def status(acfg: dict | None = None) -> dict:
         load_error = msg
         list_error = msg
     selected = str(acfg.get("model") or "").strip()
+    selected_instances: list[str] = []
+    if selected:
+        selected_instances = [mid for mid in loaded if mid == selected]
+        if not selected_instances:
+            try:
+                selected_instances = _model_instances(selected, acfg)
+            except Exception:
+                selected_instances = []
+    foreign_loaded = [mid for mid in loaded if mid not in selected_instances]
+    can_unload_now = bool(selected_instances) and not active
     return {
         "backend": acfg.get("backend"),
         "model": selected,
@@ -315,10 +342,13 @@ def status(acfg: dict | None = None) -> dict:
         "loaded_count": len(loaded),
         "available_models": models,
         "available_count": len(models),
-        "selected_model_loaded": bool(selected and selected in loaded),
+        "selected_model_loaded": bool(selected_instances),
+        "selected_model_instances": selected_instances,
+        "foreign_loaded_models": foreign_loaded,
+        "foreign_loaded_count": len(foreign_loaded),
         "active_private_jobs": active,
         "active_count": len(active),
-        "can_unload_now": not active,
+        "can_unload_now": can_unload_now,
         "load_error": load_error,
         "list_error": list_error,
         "log_path": str(LOG_FILE),

@@ -188,6 +188,22 @@ def save_private_model(model_key: str) -> str:
     return key
 
 
+def save_private_cleanup(mode: object, idle_minutes: object = None) -> dict:
+    mode = str(mode or "").strip().lower()
+    if mode not in {"keep_loaded", "idle_eject", "after_job"}:
+        raise ValueError("cleanup mode 不合法")
+    mins = 15 if idle_minutes in (None, "") else int(str(idle_minutes).strip())
+    if mins < 1 or mins > 1440:
+        raise ValueError("idle_minutes 必須介於 1 到 1440")
+    cfg = config_mod.load()
+    agent = cfg.setdefault("agent", {})
+    cleanup = agent.setdefault("private_cleanup", {})
+    cleanup["mode"] = mode
+    cleanup["idle_minutes"] = mins
+    config_mod.save(cfg)
+    return {"mode": mode, "idle_minutes": mins}
+
+
 def is_protected(name: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in jobstate.PROTECTED)
 
@@ -805,11 +821,21 @@ JOBS_PAGE = r"""<!doctype html>
   .admin{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:0 0 16px}
   .admin h2{font-size:17px;margin-bottom:8px}
   .adminmeta{font-size:13.5px;color:var(--sub);display:flex;flex-wrap:wrap;gap:4px 10px;margin:8px 0}
+  .adminstats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}
+  .adminstat{border:1px solid var(--line);border-radius:12px;background:#fcfcfd;padding:12px 13px}
+  .adminstat .k{font-size:12px;color:var(--sub);margin-bottom:6px}
+  .adminstat .v{font-size:14px;color:var(--ink);font-weight:600;line-height:1.45;word-break:break-word}
   .adminline{font-size:14px;color:var(--ink);margin-top:8px;line-height:1.6}
   .admin .btnrow{margin-top:12px}
   .admin .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
   .admin select{min-width:min(100%,420px);max-width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:#fff;font-size:14px;color:var(--ink)}
+  .admin .inputunit{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:12px;background:#fff;overflow:hidden}
+  .admin .inputunit input[type="number"]{width:88px;padding:10px 12px;border:0;border-radius:0;background:transparent;font-size:14px;color:var(--ink)}
+  .admin .inputunit input[type="number"]:focus{outline:none}
+  .admin .inputunit:focus-within{outline:2px solid var(--accent);outline-offset:-1px}
+  .admin .inputunit span{padding:0 12px;border-left:1px solid var(--line);font-size:13px;color:var(--sub);white-space:nowrap;background:#fafafc;align-self:stretch;display:flex;align-items:center}
   .adminhint{font-size:12.5px;color:var(--sub);margin-top:8px;line-height:1.6}
+  @media (max-width:640px){.adminstats{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 
 <div class="top">
@@ -823,11 +849,26 @@ JOBS_PAGE = r"""<!doctype html>
 <section class="admin">
   <h2>LM Studio 管理</h2>
   <div class="adminmeta" id="lmMeta">讀取中…</div>
+  <div class="adminstats">
+    <div class="adminstat"><div class="k">目標模型</div><div class="v" id="lmStatTarget">—</div></div>
+    <div class="adminstat"><div class="k">目前載入</div><div class="v" id="lmStatLoaded">—</div></div>
+    <div class="adminstat"><div class="k">保密任務</div><div class="v" id="lmStatJobs">—</div></div>
+    <div class="adminstat"><div class="k">手動釋放</div><div class="v" id="lmStatEject">—</div></div>
+  </div>
   <div class="adminline" id="lmLine1"></div>
   <div class="adminline" id="lmLine2"></div>
   <div class="row">
     <select id="lmModel"></select>
     <button class="btn" id="lmLoad">選擇並載入模型</button>
+  </div>
+  <div class="row">
+    <select id="lmCleanupMode">
+      <option value="keep_loaded">keep_loaded：持續保留模型</option>
+      <option value="idle_eject">idle_eject：閒置後釋放</option>
+      <option value="after_job">after_job：每次工作後釋放</option>
+    </select>
+    <div class="inputunit"><input id="lmIdleMinutes" type="number" min="1" max="1440" step="1" inputmode="numeric" aria-label="閒置分鐘數"><span>分鐘</span></div>
+    <button class="btn" id="lmSaveCleanup">儲存 cleanup 設定</button>
   </div>
   <div class="adminhint" id="lmHint">重新整理狀態時會同步抓取 LM Studio 可用模型列表。</div>
   <div class="btnrow">
@@ -932,13 +973,39 @@ function renderModelOptions(){
   sel.value = models.some(m => m.key === LM.model) ? LM.model : models[0].key;
   $('lmLoad').disabled = false;
 }
+function syncCleanupForm(){
+  const c = (LM && LM.cleanup) || {};
+  $('lmCleanupMode').value = c.mode || 'idle_eject';
+  $('lmIdleMinutes').value = c.idle_minutes || 15;
+  $('lmIdleMinutes').disabled = $('lmCleanupMode').value !== 'idle_eject';
+}
+function lmLoadedSummary(){
+  if (!LM) return '—';
+  const selected = (LM.selected_model_instances || []).filter(Boolean);
+  const foreign = (LM.foreign_loaded_models || []).filter(Boolean);
+  if (selected.length && foreign.length)
+    return '目標模型已載入；另有 ' + foreign.join('、');
+  if (selected.length)
+    return selected.join('、');
+  if (foreign.length)
+    return foreign.join('、');
+  return '目前沒有載入模型';
+}
 function renderLM(){
   if (!LM){
     $('lmMeta').textContent = '讀取中…'; $('lmLine1').textContent = ''; $('lmLine2').textContent = '';
+    $('lmStatTarget').textContent = '—';
+    $('lmStatLoaded').textContent = '—';
+    $('lmStatJobs').textContent = '—';
+    $('lmStatEject').textContent = '—';
     $('lmHint').textContent = '重新整理狀態時會同步抓取 LM Studio 可用模型列表。';
     $('lmModel').innerHTML = '<option value="">讀取中…</option>';
     $('lmModel').disabled = true;
     $('lmLoad').disabled = true;
+    $('lmCleanupMode').value = 'idle_eject';
+    $('lmIdleMinutes').value = 15;
+    $('lmIdleMinutes').disabled = false;
+    $('lmSaveCleanup').disabled = true;
     return;
   }
   const c = LM.cleanup || {};
@@ -946,19 +1013,36 @@ function renderLM(){
   const bits = [
     '策略：' + (c.mode || 'idle_eject'),
     c.mode === 'idle_eject' ? '閒置 ' + (c.idle_minutes || 15) + ' 分鐘 eject' : '',
-    '目標模型：' + (LM.model || '未設定'),
+    '可用模型：' + (LM.available_count || 0) + ' 個',
   ].filter(Boolean);
   $('lmMeta').innerHTML = bits.map(esc).join('<span>·</span>');
+  $('lmStatTarget').textContent = LM.model || '未設定';
+  $('lmStatLoaded').textContent = lmLoadedSummary();
+  $('lmStatJobs').textContent = LM.active_count
+    ? (LM.active_private_jobs || []).join('、')
+    : '目前沒有保密任務';
+  $('lmStatEject').textContent = LM.can_unload_now
+    ? '可立即釋放'
+    : ((LM.foreign_loaded_count || 0)
+        ? '不可釋放（目前是外部載入模型）'
+        : '暫不可釋放');
   $('lmLine1').textContent = '最後使用：' + ago(act.ts) + (act.job_id ? ' · job ' + act.job_id : '') + (act.stage ? ' · ' + act.stage : '');
-  $('lmLine2').textContent = (LM.active_count
-    ? '目前仍有 private jobs 執行中：' + (LM.active_private_jobs || []).join('、')
-    : '目前沒有 private jobs 在跑；可手動 eject。') +
-    (LM.load_error ? '（狀態讀取警告：' + LM.load_error + '）' : '');
+  $('lmLine2').textContent = (
+    LM.active_count
+      ? '目前仍有保密任務執行中：' + (LM.active_private_jobs || []).join('、')
+      : LM.can_unload_now
+        ? '目前沒有保密任務在跑；可手動釋放模型。'
+        : (LM.foreign_loaded_count || 0)
+          ? '目前沒有本系統的保密任務在跑，但 LM Studio 仍有其他已載入模型：' + (LM.foreign_loaded_models || []).join('、') + '；先不提供釋放。'
+          : '目前沒有保密任務在跑，也沒有偵測到保密模式目標模型已載入。'
+  ) + (LM.load_error ? '（狀態讀取警告：' + LM.load_error + '）' : '');
   $('lmHint').textContent = (LM.available_count || 0)
     ? '可選 LLM：' + LM.available_count + ' 個；選擇後會更新保密模式預設模型並立即嘗試載入。'
     : '目前沒有抓到可用模型。';
   $('lmEject').disabled = !LM.can_unload_now;
+  $('lmSaveCleanup').disabled = false;
   renderModelOptions();
+  syncCleanupForm();
 }
 async function pollLM(showInlineError=false){
   try {
@@ -967,6 +1051,10 @@ async function pollLM(showInlineError=false){
   } catch(e){
     if (showInlineError) showErr('LM Studio 狀態讀取失敗：' + e.message);
     $('lmMeta').textContent = 'LM Studio 狀態讀取失敗';
+    $('lmStatTarget').textContent = '—';
+    $('lmStatLoaded').textContent = '—';
+    $('lmStatJobs').textContent = '—';
+    $('lmStatEject').textContent = '—';
     $('lmLine1').textContent = e.message || '';
     $('lmLine2').textContent = '';
   }
@@ -1051,6 +1139,9 @@ async function poll(){
 
 ['q','fstate','sort','arch'].forEach(id =>
   $(id).addEventListener('input', render));
+$('lmCleanupMode').addEventListener('change', () => {
+  $('lmIdleMinutes').disabled = $('lmCleanupMode').value !== 'idle_eject';
+});
 $('lmRefresh').onclick = () => pollLM(true);
 $('lmLoad').onclick = () => withBtn('lmLoad', '載入中…', '已更新 ✓', async () => {
   const model = $('lmModel').value;
@@ -1059,6 +1150,20 @@ $('lmLoad').onclick = () => withBtn('lmLoad', '載入中…', '已更新 ✓', a
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({model})
+  });
+  const t = await r.text();
+  let j = {}; try { j = t ? JSON.parse(t) : {}; } catch(_){ }
+  if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+  LM = j.status || LM;
+  renderLM();
+});
+$('lmSaveCleanup').onclick = () => withBtn('lmSaveCleanup', '儲存中…', '已儲存 ✓', async () => {
+  const mode = $('lmCleanupMode').value;
+  const idle_minutes = $('lmIdleMinutes').value;
+  const r = await fetch(kq('/api/admin/lmstudio/cleanup'), {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode, idle_minutes})
   });
   const t = await r.text();
   let j = {}; try { j = t ? JSON.parse(t) : {}; } catch(_){ }
@@ -1817,7 +1922,7 @@ async def api_admin_lmstudio_select_load(request: Request, k: str = ""):
         raise HTTPException(400, "缺少 model")
     st = lmstudio_status_payload()
     if st.get("active_count"):
-        raise HTTPException(409, "仍有 private jobs 執行中，現在先不要切換模型")
+        raise HTTPException(409, "仍有保密任務執行中，現在先不要切換模型")
     available = {str(m.get("key") or "").strip(): m for m in st.get("available_models") or []}
     if model not in available:
         raise HTTPException(404, f"LM Studio 找不到模型：{model}")
@@ -1856,12 +1961,32 @@ async def api_admin_lmstudio_select_load(request: Request, k: str = ""):
     }
 
 
+@app.post("/api/admin/lmstudio/cleanup")
+async def api_admin_lmstudio_cleanup(request: Request, k: str = ""):
+    check(k)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "請提供 JSON request body")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "請求內容必須是物件")
+    try:
+        saved = save_private_cleanup(body.get("mode"), body.get("idle_minutes"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "saved_cleanup": saved, "status": lmstudio_status_payload()}
+
+
 @app.post("/api/admin/lmstudio/unload")
 def api_admin_lmstudio_unload(k: str = ""):
     check(k)
     st = lmstudio_status_payload()
     if st.get("active_count"):
-        raise HTTPException(409, "仍有 private jobs 執行中，現在先不卸載模型")
+        raise HTTPException(409, "仍有保密任務執行中，現在先不卸載模型")
+    if not st.get("can_unload_now"):
+        if st.get("foreign_loaded_count"):
+            raise HTTPException(409, "目前載入中的不是本系統保密模式目標模型，先不代為卸載其他工作負載")
+        raise HTTPException(409, "目前沒有可由本系統安全卸載的保密模式模型")
     try:
         result = lmstudio_runtime.unload_now(reason="manual_web")
     except Exception as exc:  # noqa: BLE001

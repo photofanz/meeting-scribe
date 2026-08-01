@@ -1,86 +1,105 @@
 # meeting-scribe
 
-手機錄完會議 → 上傳 → **本機**轉寫與講者分離 → AI agent 整理成會議記錄。
+**Local-first meeting transcription and meeting-note production for Apple Silicon Macs.**
 
-**音檔、逐字稿、會議記錄完全不離開你的 Mac。** 不需要專用硬體，不需要任何 SaaS 訂閱，
-不需要 OpenAI / Whisper API key，不需要 HuggingFace token。
+`meeting-scribe` 把一場會議從**手機錄音**一路處理到**逐字稿、清稿、會議記錄、PDF / Markdown / Word 交付**，全程以你的 Mac 為主機執行。它不是雲端 SaaS，也不是單一模型 demo，而是一套可長期運轉的本機會議處理系統。
 
-實測（Apple M3、128 GB）：**2 小時會議約 13 分鐘轉寫完**，約 9–10× 實時。
+## 你 clone 之後會得到什麼
 
-最近一次完整跑通的真實長會議：2 小時 07 分錄音 → 轉寫 13.1 分鐘（9.7× 實時）
-→ 切成 5 片平行掃描、整理出 8 題 → 回答後產出定稿逐字稿與會議記錄的
-Markdown / PDF / Word。順帶一提，那場的聲紋分離把 2 個人分成了 112 群——
-所以才有問題卡這一關。
+安裝完成後，你會得到一個可直接使用的系統，而不是一堆零散 script：
 
----
-
-## 這是什麼
-
-市面上的隨身錄音 AI 裝置（Pocket、Plaud、YoooClaw C·ONE…）賣的其實是三件事：
-錄音硬體、雲端轉寫、AI 整理。第一件你的手機本來就有；後兩件，**Apple Silicon 跑得夠快，
-而且不用把客戶對話交給任何第三方**。
-
-這個專案就是後兩件事的本機實作：
-
-```
-iPhone 語音備忘錄
-      │  (Tailscale 內網，分段上傳，無檔案大小限制)
-      ▼
-┌─────────────────────────────────────────┐
-│  你的 Mac                                │
-│                                          │
-│  ffmpeg 正規化 16 kHz mono（ASR）        │
-│        │                                 │
-│        ├── 聲紋分離 (sherpa-onnx, ONNX)  │
-│        │    └─ 若講者數異常：固定群數 /   │
-│        │       左右聲道 fallback 自動重跑 │
-│        └── ASR (mlx-whisper, Metal GPU)  │
-│        │                                 │
-│  合併 → 簡轉繁 → transcript.md           │
-└─────────────────────────────────────────┘
-      │
-      ▼
-┌─────────────────────────────────────────┐
-│  review 階段（claude / codex CLI 或 LM Studio API） │
-│                                          │
-│  掃描：切片平行讀完整份逐字稿            │
-│        → transcript_draft.md             │
-│        → questions.json（≤8 張卡）       │
-│        │                                 │
-│   ── 你在網頁上「點選」回答 ──           │
-│        │                                 │
-│  定稿：答案用 Python regex 套回          │
-│        → transcript_clean.md             │
-│        → 會議記錄由定稿逐字稿寫成        │
-└─────────────────────────────────────────┘
-      │
-      ▼
-  PDF / Markdown / Word → 歸檔 → 完成通知
-```
-
-長會議不是丟一個大 prompt 給模型就好——2 小時的逐字稿約 127 KB，塞不進單次
-context，而且失敗是無聲的：模型讀完開頭，自信地寫出前 20 分鐘的會議記錄，然後
-exit 0。切片與提問這兩道關卡就是為了擋這件事，設計理由見 [docs/REVIEW.md](docs/REVIEW.md)。
+- **手機可用的上傳入口**：透過瀏覽器上傳錄音，支援分段上傳與自動重試
+- **本機 ASR + 講者分離管線**：Apple Silicon 上跑 `mlx-whisper` + ONNX diarization
+- **可追蹤的 job system**：每場會議都有獨立 job 資料夾、狀態檔、可重跑產物
+- **會議 review workflow**：長逐字稿先切片掃描、出問題卡、套用答案，再寫正式文件
+- **多後端 AI 整理能力**：可接 `claude`、`codex`、對話 agent，或 LM Studio / OpenAI-compatible API
+- **交付檔案產生器**：輸出 Markdown、PDF、Word，以及會議記錄與待辦事項
+- **本機部署能力**：`install.sh` + `launchd`，可作為常駐服務運行
 
 ---
 
-## 需求
+## 核心能力
 
-| 項目 | 說明 |
+| 能力 | 說明 |
 |---|---|
-| **macOS + Apple Silicon** | 必要。ASR 走 mlx-whisper（Metal GPU），Intel Mac 與 Linux 不支援 |
-| 記憶體 | 建議 32 GB 以上。2 小時錄音峰值約 14.6 GB |
-| Homebrew | 安裝腳本會用它補齊 `ffmpeg` 與 `uv` |
-| Tailscale | 建議。沒有的話上傳頁只在區網可見，僅靠 token 保護 |
-| Google Chrome | 選用，PDF 輸出用它 headless 渲染 |
-| pandoc | 選用，Word (.docx) 輸出需要 |
-| AI agent | 選用。轉寫本身不需要。會議記錄需要一個 LLM：可以是對話 agent、本機 `claude` / `codex` CLI，或另一台機器上的 LM Studio（OpenAI-compatible API；見 [docs/AGENT.md](docs/AGENT.md)） |
-
-首次轉寫時 mlx-whisper 會自動抓 ASR 模型（約 1.5 GB）。之後全離線。
+| **本機轉寫** | 音檔在本機完成正規化、ASR、簡轉繁，不依賴 Whisper API 或 SaaS 轉寫服務 |
+| **講者分離** | 以 `sherpa-onnx` + CAM++ zh 執行聲紋分群；支援 headcount-aware fallback |
+| **長會議處理** | 大型逐字稿可自動切片、平行掃描，避免單次 prompt silent failure |
+| **互動式清稿** | 把姓名、術語、金額、矛盾敘述整理成可點選回答的問題卡 |
+| **雙 AI 模式** | 一般模式可接 Claude / Codex；保密模式可接 LM Studio 本機模型 |
+| **可控模型卸載** | 內建 private model cleanup 策略：`keep_loaded` / `idle_eject` / `after_job` |
+| **多格式產出** | 可輸出 `transcript` / `meeting note`，格式支援 `md` / `pdf` / `docx` |
+| **可重跑、可稽核** | 保留 source、raw transcript、answers、state；可隨時重寫文件而不必重傳音檔 |
+| **通知與交付** | 支援 `none` / `telegram` / `command` / `webhook` 四種通知模式 |
 
 ---
 
-## 安裝
+## 產品定位
+
+`meeting-scribe` 適合這些情境：
+
+- **顧問 / 業務 / PM / Founder**：需要把長會議快速整理成可發出的正式記錄
+- **重視隱私的團隊**：不想把客戶會議、訪談內容送到第三方雲端 ASR / note service
+- **Apple Silicon 工作站**：希望用一台常駐的 Mac 當內部會議處理節點
+- **長會議與高風險內容**：不能接受模型只讀前半段就自信產出摘要的情境
+
+它不是錄音硬體，也不是公有雲協作平台；它是**本機會議處理基礎設施**。
+
+---
+
+## 系統規格
+
+| 項目 | 規格 |
+|---|---|
+| **作業系統** | macOS |
+| **硬體** | Apple Silicon 必要 |
+| **ASR backend** | `mlx-whisper`（Metal GPU） |
+| **Diarization** | `sherpa-onnx-pyannote-segmentation-3-0` + `3D-Speaker CAM++ zh` |
+| **建議記憶體** | 32 GB 以上 |
+| **2 小時會議峰值記憶體** | 約 14.6 GB |
+| **輸入** | m4a / 一般音訊檔（經 ffmpeg 正規化） |
+| **輸出** | `transcript.md/.json/.txt`、`transcript_clean.md/.pdf/.docx`、`note_*.md/.pdf/.docx`、`action_items.json` |
+| **部署方式** | 本機 repo + Python venv + `launchd` |
+| **網路需求** | 建議搭配 Tailscale；未使用時上傳頁僅適合區網環境 |
+
+### 實測效能
+
+在 Apple Silicon 上，2 小時錄音可在約 **13 分鐘**內完成轉寫，約 **9–10× realtime**。詳細數據與選型比較見 [`BENCHMARK.md`](BENCHMARK.md)。
+
+---
+
+## 架構總覽
+
+```text
+手機錄音 / 音檔
+      │
+      ▼
+分段上傳 Web UI
+      │
+      ▼
+ffmpeg 正規化 ──┬── ASR (mlx-whisper / Metal)
+                └── 講者分離 (sherpa-onnx / ONNX)
+      │
+      ▼
+transcript.md / transcript.json / transcript.txt
+      │
+      ▼
+review pipeline
+  ├─ scan：切片、平行掃描、產生問題卡
+  ├─ answer：使用者在 /job/<id> 回答關鍵不確定項
+  └─ write：Python 套答案後，再由 AI 寫正式文件
+      │
+      ▼
+Markdown / PDF / Word / action_items / delivery
+```
+
+這個設計的目的不是「多一段流程」，而是讓系統能穩定處理**長逐字稿、講者錯配、術語歧義、關鍵數字不清**這些真實世界問題。review stage 的設計理由見 [`docs/REVIEW.md`](docs/REVIEW.md)。
+
+---
+
+## 快速開始
+
+### 1. 安裝
 
 ```bash
 git clone https://github.com/photofanz/meeting-scribe.git ~/Meetings
@@ -88,316 +107,216 @@ cd ~/Meetings
 ./install.sh
 ```
 
-腳本會做這六件事，可重複執行：
+`install.sh` 會完成：
 
-1. 檢查平台與必要工具（缺 `ffmpeg` / `uv` 會用 brew 補）
-2. 建立資料夾
-3. 產生 `config.json` 與上傳 token（`.token`，權限 600）
-4. 建 Python 3.12 venv 並裝相依套件
-5. 下載聲紋分離模型（約 34 MB，**帶 SHA256 驗證**）
-6. 產生並載入 launchd LaunchAgent，開機自動啟動
+1. 檢查平台與必要工具
+2. 建立資料夾結構
+3. 產生 `config.json` 與 `.token`
+4. 建立 Python 3.12 venv 並安裝依賴
+5. 下載講者分離模型（含 SHA256 驗證）
+6. 安裝並載入 `launchd` LaunchAgent
 
-跑完會印出上傳頁網址。加 `--no-service` 可跳過背景服務設定。
+> 專案不必放在 `~/Meetings`；所有腳本都依自身位置推導 root path。
 
-> **路徑不限定在 `~/Meetings`。** 所有腳本都從自身位置推導根目錄，clone 到哪都能跑。
-
----
-
-## 設定
-
-`config.json`（安裝時從 `config.example.json` 複製，不進版控）：
-
-```json
-{
-  "port": 8765,
-  "service_label": "com.meetingscribe.uploader",
-  "notify": {
-    "mode": "none",
-    "events": ["awaiting_answers", "done", "error"],
-    "telegram": {"bot_token": "", "chat_id": ""},
-    "command": "",
-    "webhook": {"url": "", "secret": ""}
-  },
-  "branding": {
-    "brand_name": "MEETING NOTES",
-    "client_footer": "本文件內容以雙方會議討論為準。",
-    "participants_hint": "例：王總、張經理、我"
-  },
-  "asr": {
-    "whisper_model": "mlx-community/whisper-large-v3-turbo",
-    "diarization_threads": 4,
-    "diarization_threshold": 0.75,
-    "diarization_max_speakers": 8,
-    "diarization_stereo_fallback": true
-  },
-  "agent": {
-    "mode": "review",
-    "backend": "claude",
-    "bin": null,
-    "model": null,
-    "default_preset": "general",
-    "profiles": {
-      "general": {
-        "backend": "claude",
-        "bin": null,
-        "model": null
-      },
-      "private": {
-        "backend": "openai_compat",
-        "bin": null,
-        "model": "gpt-oss-120b",
-        "api": {
-          "base_url": "http://100.85.219.106:1234/v1",
-          "api_key": "lm-studio",
-          "endpoint": "chat_completions",
-          "temperature": 0.1,
-          "max_output_tokens": 16384
-        }
-      }
-    },
-    "api": {
-      "base_url": "http://127.0.0.1:1234/v1",
-      "api_key": "lm-studio",
-      "endpoint": "chat_completions",
-      "temperature": 0.1,
-      "max_output_tokens": 16384
-    },
-    "timeout_sec": 3600,
-    "chunk_chars": 14000,
-    "max_parallel": 3,
-    "max_questions": 8,
-    "private_cleanup": {
-      "mode": "idle_eject",
-      "idle_minutes": 15,
-      "unload_endpoint": "/api/v1/models/unload"
-    }
-  }
-}
-```
-
-每個鍵都可省略，省略就吃 `bin/config.py` 的預設值；`config.example.json` 裡有逐鍵說明。
-改完跑 `./install.sh`（重生 plist）或 `./bin/service.sh restart`。
-
-**通知**（`notify.mode`，四選一，預設完全不推播）：
-
-| mode | 做什麼 | 需要什麼 |
-|---|---|---|
-| `none` | 不推播，所有狀態都在 `/jobs` 頁看 | 無（預設，讓全新 clone 不依賴任何其他軟體） |
-| `telegram` | 直接打 Telegram Bot API | @BotFather 的 token 與 chat id |
-| `command` | 呼叫你原本就在用的通知 CLI | 一組 argv 樣板 |
-| `webhook` | POST 帶 HMAC-SHA256 簽章的 JSON 到你的服務 | url ＋ secret |
-
-```bash
-.venv/bin/python bin/notify_setup.py     # 互動式填完並自動驗證
-```
-
-`notify.events` 決定哪些狀態值得推。`command` 模式的 `{message}` / `{files}` 是在
-argv 切分**之後**才代入，所以會議標題含引號或空白也不會變成多餘參數。推不出去的
-訊息會寫進 `logs/undelivered.log`，主流程照跑。舊版 `notify.enabled/bin/target`
-設定檔仍相容，載入時自動對應到 `command` 模式。
-
-**文件撰寫**（`agent.mode`）：
-
-| mode | 行為 |
-|---|---|
-| `review` | **預設。** 掃描 → 在 `/job/<id>` 出題 → 你點選回答 → 才寫文件 |
-| `auto` | 掃描與撰寫連續跑完，全用 `best_guess`，沒有人在迴圈裡 |
-| `manual` | 停在逐字稿，由你（或對話 agent）手動啟動 |
-
-`review` 是預設，因為那些答案正是阻止會議記錄捏造人名與數字的東西；`auto` 產出的
-文件品質較差，而且文件開頭會自己說明這件事。細節見 [docs/REVIEW.md](docs/REVIEW.md)
-與 [docs/AGENT.md](docs/AGENT.md)。
-
-**LM Studio / OpenAI-compatible backend**：現在建議直接用 UI 的兩個 preset：
-
-- **一般模式** → `agent.profiles.general`（通常是 `claude` 或 `codex`）
-- **保密模式** → `agent.profiles.private`（通常是 `openai_compat` + LM Studio）
-
-`agent.default_preset` 決定新上傳預設勾哪個；job 詳細頁也可以隨時切換。若走
-LM Studio，請填 `agent.profiles.private.api.base_url`（例如 `http://100.x.y.z:1234/v1`，
-建議走 Tailscale）、`api_key` 與 `model`（例如 `gpt-oss-120b`）。`endpoint` 可選
-`chat_completions`（相容性最廣）或 `responses`。
-
-若希望 LM Studio 用完後把模型 eject 掉，設 `agent.private_cleanup`：
-
-- `mode=keep_loaded`：模型常駐，下一次最快
-- `mode=idle_eject`：閒置 `idle_minutes` 後呼叫 `POST /api/v1/models/unload`
-- `mode=after_job`：每次 private job 完成就立刻 unload
-
----
-
-## 使用
-
-### 1. 手機開上傳頁
+### 2. 取得上傳網址
 
 ```bash
 ./bin/service.sh url
 ```
 
-建議在 Safari 加入主畫面。分段上傳（4 MB／段，失敗自動重試），**沒有檔案大小上限**。
+### 3. 上傳錄音、選擇輸出
 
-### 2. 填表
+上傳表單支援：
 
-最值得花時間的欄位是**「背景／專有名詞」**，第二值得的是**「現場約幾人」**。
-前者能提升術語與人名辨識；後者現在不只是 metadata，而是聲紋分群炸掉時的
-**deterministic fallback 訊號**：系統會自動拿它去重跑固定群數候選，而不是放任
-2 人會議切成 25 / 112 群。
+- 輸出內容：逐字稿 / 會議記錄
+- 會議類型：一般討論 / 顧問客戶 / 訪談研究
+- 檔案格式：PDF / Markdown / Word
+- AI preset：一般模式 / 保密模式
 
-**產出選項**（選擇記在瀏覽器，下次自動帶入）
+### 4. 等待轉寫與 review
 
-| # | 選項 | `meta.json` 欄位 | 預設 |
-|---|---|---|---|
-| 1 | 輸出內容（可複選）：逐字稿 · 會議記錄 | `want_transcript` / `want_note` | 會議記錄 |
-| 2 | 會議類型：一般討論 / 顧問客戶三版 / 訪談研究 | `meeting_type` | `general` |
-| 3 | 輸出檔案型態（可複選）：PDF · Markdown · Word | `formats` | `["pdf","md"]` |
+預設 `agent.mode = "review"`：
 
-`formats` 是全域的，對這個 job 的每份文件都套用。兩段都有防呆：一項都不勾會擋下，
-後端另有保險會強制回到「會議記錄」。
-
-### 3. 回答問題（`agent.mode = "review"`，預設）
-
-轉寫完成後，系統會平行讀完整份逐字稿，然後把**只有你才知道答案**的事情整理成
-最多 8 張卡片，狀態轉為 `awaiting_answers`，並在 `/job/<id>` 等你。
-
-卡片一律設計成**用點的就能回答**——要你打一段字的問題就是錯的問題。五種類型：
-
-| 類型 | 什麼時候出現 |
-|---|---|
-| `speaker` | 某個聲紋標籤（講者1／講者2）到底是誰。排第一，因為把話講錯人比什麼都嚴重 |
-| `term` | 同一個專有名詞被 ASR 拼成好幾種寫法，要選一個正式版本 |
-| `unclear` | 音質太差，某個關鍵數字／日期／金額救不回來 |
-| `conflict` | 逐字稿裡有兩句互相矛盾，必須有一個勝出 |
-| `undecided` | 會議其實沒有結論，但會議記錄非得寫一句 |
-
-答完按送出，答案會用 Python `re.sub` **機械式**套回逐字稿（不是交給模型記憶對照表），
-產出 `transcript_clean.md`，會議記錄才從這份定稿寫起。實際替換了什麼，會列在定稿
-逐字稿末尾的更正表——列的是真的做了什麼，不是模型說它做了什麼。
-
-改成 `manual` 則停在逐字稿，回一句「整理這場會議」由對話 agent 接手；改成 `auto`
-則全程不問你。三種模式共用同一份規格 `templates/NOTE_SPECS.md` —— **那份檔案就是
-給 agent 讀的合約**，所以產出的文件結構一致。
-
-手動重跑某個 job：
-
-```bash
-.venv/bin/python bin/review.py latest --stage scan             # 只出題
-.venv/bin/python bin/review.py latest --stage write --deliver  # 套用答案並寫文件
-.venv/bin/python bin/review.py latest --stage auto  --deliver  # 兩段連跑，不問人
-.venv/bin/python bin/chunker.py archive/<job_id>/transcript.md # 只看切片計畫，不花模型時間
-```
+- 先完成逐字稿與掃描
+- 若有關鍵不確定項，會在 `/job/<id>` 顯示問題卡
+- 你回答後，系統才會產出定稿逐字稿與會議記錄
 
 ---
 
-## 產出
+## 輸出與資料結構
 
-```
+每場會議都會在 `archive/` 下建立一個 job 目錄：
+
+```text
 archive/<YYYY-MM-DD>_<對象>_<6碼>/
-    source.m4a            原始音檔
-    meta.json             上傳表單內容 + 產出選項
-    status.json           處理進度（UI 與 agent 都輪詢這個）
-    state.json            狀態機與各階段時間戳
-    transcript.md         逐字稿（繁體、講者標籤、時間戳）
-    transcript.json       結構化（每段的講者與起訖時間）
-    transcript.txt        純文字
-    questions.json        掃描階段整理出的問題卡
-    answers.json          你在網頁上的回答
-    transcript_draft.md   掃描後、套答案前的草稿
-    transcript_clean.md   定稿逐字稿（+ .pdf / .docx，末尾附更正表）
-    note_*.md/.pdf/.docx  會議記錄
-    action_items.json     待辦事項
-    delivery.json         這次交付了哪些檔案
-    agent_report.json     agent 自述做了什麼
-    INDEX.md              檔案清單與機密層級
-    .chunks/ .review/     切片與提示詞暫存（出問題時的診斷材料）
+    source.m4a
+    meta.json
+    status.json
+    state.json
+    transcript.md
+    transcript.json
+    transcript.txt
+    questions.json
+    answers.json
+    transcript_draft.md
+    transcript_clean.md
+    note_*.md
+    action_items.json
+    delivery.json
+    agent_report.json
+    INDEX.md
 ```
 
-後綴 6 碼是為了同一天同對象開兩場會不撞名。
+### 哪些資料會被保留
 
-jobs 頁的「清理產出」只刪得掉可重生的那些檔案——**音檔、原始逐字稿、你的答案與
-job metadata 永遠保留**，所以任何一場會議都能事後換模板重跑，或改完人名重寫，
-不必重新上傳錄音。
+`meeting-scribe` 的設計不是「跑完就丟」，而是保留足夠材料讓你之後能重跑與稽核：
+
+- **永遠保留**：原始音檔、原始逐字稿、問題卡答案、job metadata
+- **可重生**：draft、clean transcript、note、PDF、Word、暫存 review 資料
+
+這代表你可以：
+
+- 改模板後重寫同一場會議記錄
+- 修正姓名或術語後重新產出文件
+- 不重新上傳錄音就重做交付
 
 ---
 
-## 組成
+## AI / Agent 整合
 
-| 檔案 | 做什麼 |
+### 支援的整理後端
+
+| 類型 | 用途 |
 |---|---|
-| `bin/config.py` | 部署設定載入（`ROOT` 由檔案位置推導，非硬編碼） |
-| `bin/upload_server.py` | 上傳網頁與 jobs／job 頁（FastAPI，分段上傳，問題卡 UI） |
-| `bin/process_meeting.py` | ffmpeg → 聲紋分離 ∥ ASR → 字級切分 → 簡轉繁 |
-| `bin/zhtw.py` | 簡轉繁（s2tw + 台灣商務／技術詞修正表） |
-| `bin/jobstate.py` | job 狀態的唯一真相（`state.json`，UI 只讀這個） |
-| `bin/chunker.py` | 逐字稿決定性切片（不會把一個發言切兩半） |
-| `bin/review.py` | 兩階段產文：掃描出題 → 套用答案 → 寫文件 |
-| `bin/agent_note.py` | 單次撰寫（短會議夠用，長會議走 `review.py`） |
-| `bin/notify.py` | 對外通知的唯一出口（none／telegram／command／webhook） |
-| `bin/notify_setup.py` | 互動式設定通知並當場驗證送得出去 |
-| `bin/make_pdf.py` | Markdown → 品牌 HTML → PDF（headless Chrome） |
-| `bin/make_docx.py` | Markdown → Word（pandoc + CJK 字型範本） |
-| `bin/run_job.sh` | 比 HTTP request 活得久的 shell wrapper，依 `agent.mode` 決定後續 |
-| `bin/service.sh` | launchd 控制器 |
-| `templates/NOTE_SPECS.md` | 各類會議記錄的結構規格（agent 讀這份） |
-| `templates/SCAN_TASK.md` | 掃描階段給 agent 的指令 |
-| `templates/PARTIAL_TASK.md` | map-reduce 撰寫時，單一切片的取材指令 |
-| `templates/AGENT_TASK.md` | 撰寫階段給 agent 的指令 |
+| **對話 agent** | 由 Hermes / Claude Code 類型 agent 手動接手整理 |
+| **本機 CLI** | `claude` / `codex` 背景執行，適合自動化 |
+| **OpenAI-compatible API** | 例如 LM Studio，適合保密模式 |
 
-模型：
+### 兩種預設模式
 
-- ASR：`mlx-community/whisper-large-v3-turbo`（Apple Metal）
-- 語者分段：`sherpa-onnx-pyannote-segmentation-3-0`
-- 聲紋比對：`3D-Speaker CAM++ zh`
+| 模式 | 典型後端 | 用途 |
+|---|---|---|
+| **一般模式** | `claude` / `codex` | 日常會議整理 |
+| **保密模式** | `openai_compat` + LM Studio | 敏感會議與本地模型處理 |
 
-選型理由與 benchmark 見 [`BENCHMARK.md`](BENCHMARK.md)。
+### LM Studio cleanup 策略
+
+| 模式 | 行為 |
+|---|---|
+| `keep_loaded` | 模型常駐，下一次最快 |
+| `idle_eject` | 閒置 `idle_minutes` 後自動卸載 |
+| `after_job` | 每次保密任務完成後立即卸載 |
+
+系統現在也提供 LM Studio 管理狀態卡，可清楚顯示：
+
+- 目標模型
+- 目前載入模型
+- 保密任務是否仍在執行
+- 是否允許手動釋放模型
+
+更多 agent 接法與手動 / 自動流程見 [`docs/AGENT.md`](docs/AGENT.md)。
 
 ---
 
-## 維運
+## 主要設定
+
+安裝時會從 `config.example.json` 產生 `config.json`。常用區塊如下：
+
+| 區塊 | 用途 |
+|---|---|
+| `port` / `service_label` | Web 服務與 launchd 設定 |
+| `notify` | 通知模式與目的地 |
+| `branding` | 文件品牌名與 footer |
+| `asr` | Whisper model、speaker threshold、fallback 行為 |
+| `agent.mode` | `review` / `auto` / `manual` |
+| `agent.profiles` | 一般模式 / 保密模式的模型後端 |
+| `agent.private_cleanup` | 保密模式模型卸載策略 |
+
+### 通知模式
+
+| mode | 說明 |
+|---|---|
+| `none` | 不推播，僅在 `/jobs` 查狀態 |
+| `telegram` | 直接發 Telegram Bot 通知 |
+| `command` | 呼叫自有 CLI / script |
+| `webhook` | POST JSON 到內部系統 |
+
+互動式設定工具：
 
 ```bash
-./bin/service.sh status      # PID / 狀態 / HTTP 碼
-./bin/service.sh url         # 上傳頁完整網址
-./bin/service.sh restart     # 改完程式碼
+.venv/bin/python bin/notify_setup.py
+```
+
+---
+
+## 維運指令
+
+```bash
+./bin/service.sh status
+./bin/service.sh url
+./bin/service.sh restart
 ./bin/service.sh log 50
-./bin/service.sh rotate      # log 超過 5 MB 才輪替
-./bin/service.sh disable     # 永久停用（登入不再自啟）
+./bin/service.sh rotate
+./bin/service.sh disable
 ```
 
-不經網頁手動轉寫：
+### 手動處理 job
 
 ```bash
-.venv/bin/python bin/process_meeting.py <音檔> \
-  --outdir archive/<job_id> --language zh \
-  --title "..." --client "..." --date YYYY-MM-DD \
-  --initial-prompt "以下是繁體中文商務會議錄音。背景與專有名詞：..."
+.venv/bin/python bin/review.py latest --stage scan
+.venv/bin/python bin/review.py latest --stage write --deliver
+.venv/bin/python bin/review.py latest --stage auto --deliver
+.venv/bin/python bin/chunker.py archive/<job_id>/transcript.md
 ```
 
 ---
 
-## 限制（都是真的踩過的）
+## 專案組成
 
-1. **講者標籤沒有姓名**，是聲紋分群結果（講者1／講者2）。`review` 模式會直接問你
-   哪個標籤是誰，答完才機械式替換；`auto` 模式則只能靠內容推斷，會猜錯。
-2. **線上會議錄音的聲紋分離會失準。** 各人裝置與網路不同造成音色差異，實測一場三人
-   線上會議被分成 61 群，另一場被分成 112 群。實體會議、單一麥克風的效果好得多。
-   **分不準時不要硬猜是誰**——這正是問題卡存在的理由。
-3. **逐字稿一定有同音錯字**，清稿是必要步驟，不是加分項。實測同一個姓氏被 ASR 寫成
-   七種版本（革新／葛新／葛星／葛晶／可欣／可信／可惜），這種只能問人。
-4. **要連得到 Tailscale**（或至少同一區網）。
-5. **Mac 要開機且已登入。** 這是 LaunchAgent，開機停在登入畫面不會啟動——
-   無人值守的機器請開自動登入。
-6. **3 小時以上建議先切段。** 2 小時峰值記憶體約 14.6 GB。
-7. **上傳頁只靠 token 保護**，沒有帳號系統。它的安全模型建立在「只有 Tailnet 連得到」。
-   不要把它 port-forward 到公網。
+| 檔案 / 模組 | 角色 |
+|---|---|
+| `bin/upload_server.py` | 上傳頁、jobs 頁、job 詳細頁、問題卡 UI |
+| `bin/process_meeting.py` | 音訊正規化、ASR、講者分離、逐字稿整理 |
+| `bin/review.py` | scan → answer → write 的長會議處理流程 |
+| `bin/agent_note.py` | 單次文件撰寫 |
+| `bin/lmstudio_runtime.py` | LM Studio 狀態、模型載入與 cleanup 決策 |
+| `bin/notify.py` | 對外通知統一出口 |
+| `bin/make_pdf.py` / `bin/make_docx.py` | 文件格式轉換 |
+| `templates/NOTE_SPECS.md` | 會議記錄規格合約 |
+| `templates/SCAN_TASK.md` / `PARTIAL_TASK.md` / `AGENT_TASK.md` | AI 階段指令模板 |
 
 ---
 
-## 安全
+## 文件導覽
 
-- `.gitignore` 用**拒絕全部再白名單**的寫法。這個 repo 就住在放真實客戶錄音的資料夾裡，
-  一般的「忽略這些路徑」寫法只要漏一條就會外洩。
-- `.token`、`config.json`、`archive/`、`logs/`、`models/`、`.venv/` 都不進版控。
-- 提交前確認：`git status --porcelain` 不該出現任何 `archive/` 或音檔。
+| 文件 | 內容 |
+|---|---|
+| [`docs/AGENT.md`](docs/AGENT.md) | 如何接 Claude / Codex / 對話 agent / LM Studio |
+| [`docs/REVIEW.md`](docs/REVIEW.md) | review stage 的設計原因與失敗保護機制 |
+| [`BENCHMARK.md`](BENCHMARK.md) | 實測速度、記憶體、模型選型數據 |
+| [`docs/DIARIZATION_RESEARCH.md`](docs/DIARIZATION_RESEARCH.md) | 講者分離研究與條件式 fallback 背景 |
+
+---
+
+## 限制與部署邊界
+
+這些不是 TODO，而是目前系統的真實邊界：
+
+1. **僅支援 macOS + Apple Silicon。** ASR 依賴 `mlx-whisper` 的 Metal backend。
+2. **講者分離不等於講者姓名辨識。** 系統能分出聲紋群組，但姓名對應仍需 review 階段確認。
+3. **線上會議錄音的聲紋分離品質可能顯著下降。** 多裝置、多麥克風、多網路條件會破壞 speaker consistency。
+4. **逐字稿必然仍需清稿。** 特別是姓名、術語、數字、日期、金額等高風險欄位。
+5. **這不是公開網際網路服務。** 建議只在 Tailscale / LAN 內使用；上傳頁靠 token 防護，沒有完整帳號系統。
+6. **3 小時以上長音檔建議先切段。** 雖然系統可處理，但資源峰值與等待時間會上升。
+
+---
+
+## 安全模型
+
+- `.gitignore` 採 **deny-all + whitelist** 策略，降低誤提交真實會議資料的風險
+- `config.json`、`.token`、`archive/`、`logs/`、`models/`、`.venv/` 不進版控
+- jobs 的「清理產出」只刪除可重生檔案，不刪原始證據與設定材料
+- 保密模式的模型釋放邏輯會避免誤卸載其他工作負載的 foreign loaded model
 
 ---
 
