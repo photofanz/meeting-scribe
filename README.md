@@ -2,21 +2,21 @@
 
 [繁體中文版本](README.zh-TW.md)
 
-**A local-first meeting intelligence pipeline for Apple Silicon Macs.**
+**A local-first meeting transcription and review system for Apple Silicon Macs.**
 
-`meeting-scribe` turns meeting recordings into deliverable transcripts and formal meeting documents. It covers the full workflow from **upload, transcription, speaker diarization, review, document generation, and delivery**, all running on your own Mac. It is not a cloud SaaS product or a one-off model demo. It is a local meeting-processing infrastructure layer designed for real operational workflows.
+`meeting-scribe` is a demo project that shows how a single Mac can handle the full path from **audio upload to transcript, review, meeting-note generation, and final delivery**. It is built for teams that want more control than cloud note-taking tools, and for builders exploring practical patterns for long-form meeting processing.
 
-## What you can enable right after deployment
+Rather than presenting transcription as a single API call, this project demonstrates a complete workflow: browser upload, local ASR, speaker diarization, question-driven review, AI writing backends, and multi-format deliverables.
 
-`meeting-scribe` is not a loose collection of scripts. It is a deployable, continuously operable local meeting-processing solution:
+## Highlights
 
-- **Mobile-friendly upload entry point**: Upload large recordings from a browser with chunked transfer, automatic retry, and a workflow designed for long-form audio.
-- **On-device transcription and speaker diarization pipeline**: Built on Apple Silicon, `mlx-whisper`, and ONNX diarization for speed, privacy, and control.
-- **Traceable and replayable job system**: Every meeting has its own state, artifacts, and intermediate materials for rewriting, auditing, and delivery.
-- **Review workflow for long meetings**: Uses chunked scanning, question cards, and answer injection to reduce summary drift and factual errors in long transcripts.
-- **Switchable AI backends**: Supports `claude`, `codex`, chat-style agents, and LM Studio / OpenAI-compatible APIs.
-- **Document generation and delivery**: Outputs transcripts, meeting notes, action items, and deliverables in `Markdown / PDF / Word`.
-- **Long-running local deployment mode**: Uses `install.sh` and `launchd` to provide a maintainable internal service.
+- **Browser-based upload for large recordings**: Supports chunked upload, retry, and long-form audio intake from phones or laptops.
+- **Fully local transcription path**: Runs on Apple Silicon with `mlx-whisper`, `ffmpeg`, and ONNX-based diarization.
+- **Review before final output**: Surfaces unclear names, numbers, jargon, and contradictions as question cards instead of letting them silently leak into the final note.
+- **Regenerable job artifacts**: Preserves source audio, raw transcripts, answers, and state so outputs can be rewritten without starting over.
+- **Multiple writing backends**: Can hand off to `claude`, `codex`, local chat-style agents, or LM Studio through an OpenAI-compatible interface.
+- **Delivery-ready exports**: Produces transcript and meeting-note outputs in `Markdown`, `PDF`, and `DOCX`.
+- **Simple local deployment**: Installs as a long-running `launchd` service for internal use.
 
 ---
 
@@ -24,28 +24,26 @@
 
 | Capability | Description |
 |---|---|
-| **Local-first transcription** | Audio is normalized, transcribed, and converted from simplified to traditional Chinese locally, without relying on the Whisper API or third-party transcription SaaS. |
-| **Speaker-aware processing** | Uses `sherpa-onnx` + CAM++ zh for speaker clustering, with headcount-aware fallback support. |
-| **Long-meeting reliability** | Large transcripts can be chunked and scanned in parallel to avoid silent failure from a single prompt over long content. |
-| **Interactive review** | Names, jargon, amounts, and conflicting statements are turned into answerable question cards before they enter final deliverables. |
+| **Local-first transcription** | Audio is normalized and transcribed locally instead of being sent to a transcription SaaS by default. |
+| **Speaker-aware processing** | Uses `sherpa-onnx` + CAM++ zh for speaker clustering, with conditional fallback strategies for weaker diarization cases. |
+| **Review-centered reliability** | Long transcripts are chunked, scanned, and reviewed before final writing, which helps reduce hallucinated certainty in high-risk details. |
+| **Interactive clarification flow** | Ambiguous names, terms, figures, and conflicting statements are collected into answerable question cards. |
 | **Dual AI operating modes** | General mode can use Claude / Codex; privacy mode can use local LM Studio models. |
-| **Controlled model lifecycle** | Includes private model cleanup strategies: `keep_loaded`, `idle_eject`, and `after_job`. |
-| **Multi-format deliverables** | Can output `transcript` and `meeting note` formats in `md`, `pdf`, and `docx`. |
-| **Replayability and auditability** | Preserves source files, raw transcripts, answers, and state so documents can be regenerated without re-uploading audio. |
-| **Notification and delivery integration** | Supports `none`, `telegram`, `command`, and `webhook` notification modes. |
+| **Replayability and auditability** | Source files, transcripts, answers, and state are preserved so the same job can be rerun or audited later. |
+| **Multi-format deliverables** | Can output `transcript` and `meeting note` artifacts in `md`, `pdf`, and `docx`. |
+| **Notification integration** | Supports `none`, `telegram`, `command`, and `webhook` notification modes. |
 
 ---
 
-## Product positioning
+## What this repo is for
 
-`meeting-scribe` is built for work environments that need to balance **privacy, accuracy, and deliverability**:
+`meeting-scribe` is best read as:
 
-- **Consultants, sales teams, PMs, and managers**: Need to turn long meetings into sendable formal records and action items.
-- **Teams that care about privacy and data boundaries**: Do not want client meetings, interviews, or internal discussions sent to third-party cloud services.
-- **Internal workstations built around Apple Silicon**: Want a dedicated Mac to act as a stable internal meeting-processing node.
-- **Long meetings and high-risk content**: Cannot accept summaries that look complete while actually covering only the first part of the meeting.
+- **an internal tooling demo** for long-form meeting processing,
+- **a reference architecture** for local-first transcription + review workflows,
+- **and a practical starting point** for teams that want more control over sensitive meeting data.
 
-It is not recording hardware and not a public cloud collaboration platform. It is closer to a **deployable local meeting-processing layer** for internal use.
+It is **not** a polished multi-tenant SaaS product, a public internet service, or a universal cross-platform recorder. The value of this repo is in the workflow design: how to turn unreliable raw transcripts into outputs that are reviewable, repeatable, and delivery-ready.
 
 ---
 
@@ -62,11 +60,11 @@ It is not recording hardware and not a public cloud collaboration platform. It i
 | **Input** | m4a / common audio formats (normalized via ffmpeg) |
 | **Output** | `transcript.md/.json/.txt`, `transcript_clean.md/.pdf/.docx`, `note_*.md/.pdf/.docx`, `action_items.json` |
 | **Deployment** | Local repo + Python venv + `launchd` |
-| **Network** | Tailscale recommended; without it, the upload page should be treated as LAN-only |
+| **Network** | Tailscale recommended; otherwise treat the upload page as LAN-only |
 
 ### Measured performance
 
-On Apple Silicon, a 2-hour recording can be transcribed in about **13 minutes**, roughly **9–10× realtime**. See [`BENCHMARK.md`](BENCHMARK.md) for detailed benchmarks and model comparisons.
+On Apple Silicon, a 2-hour recording can be transcribed in about **13 minutes**, roughly **9–10× realtime**. See [`BENCHMARK.md`](BENCHMARK.md) for benchmark details and model comparisons.
 
 ---
 
@@ -95,7 +93,7 @@ review pipeline
 Markdown / PDF / Word / action_items / delivery
 ```
 
-The point of this design is not to add extra process for its own sake. It is meant to handle real-world issues such as **long transcripts, speaker mismatch, terminology ambiguity, and unclear key numbers** in a stable way. See [`docs/REVIEW.md`](docs/REVIEW.md) for the rationale behind the review stage.
+This extra review stage is the core idea of the project. It exists to handle real-world failure modes such as **speaker mismatch, terminology ambiguity, unclear numbers, and long transcripts that exceed what a single prompt can reliably process**. See [`docs/REVIEW.md`](docs/REVIEW.md) for the design rationale.
 
 ---
 

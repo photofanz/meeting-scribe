@@ -2,21 +2,21 @@
 
 [English version](README.md)
 
-**適用於 Apple Silicon Mac 的本機優先會議智慧處理管線。**
+**為高信任度會議交付而設計的本機優先處理系統。**
 
-`meeting-scribe` 將會議錄音轉化為可交付的逐字稿與正式會議文件，涵蓋**上傳、轉寫、講者分離、清稿、文件生成與交付**的完整流程，並全程以你的 Mac 為執行主機。它不是雲端 SaaS，也不是一次性的模型展示，而是一套面向真實工作流設計的本機會議處理基礎設施。
+`meeting-scribe` 不是單純把錄音轉成文字的工具，而是一套面向真實商務工作流設計的**會議交付基礎設施**。它將會議錄音一路轉化為可審閱、可追溯、可正式交付的逐字稿與會議文件，涵蓋**上傳、轉寫、講者分離、問題澄清、文件生成與交付**的完整流程，並全程以你的 Mac 為執行主機。
 
-## 部署後可立即啟用的能力
+對顧問團隊、專業服務公司與重視客戶信任的組織而言，問題從來不是「能不能生成摘要」，而是：**能不能在保護資料邊界的前提下，穩定產出足夠正式、足夠準確、足夠能代表專業形象的交付成果。** `meeting-scribe` 回答的正是這個問題。
 
-`meeting-scribe` 不是零散工具的拼裝，而是一套可直接部署、可持續運行的本機會議處理解決方案：
+## 方案重點
 
-- **行動端可用的上傳入口**：透過瀏覽器完成大檔錄音上傳，支援分段傳輸、自動重試與穩定的長檔處理流程
-- **本機執行的轉寫與講者分離管線**：基於 Apple Silicon、`mlx-whisper` 與 ONNX diarization，兼顧速度、隱私與可控性
-- **可追蹤、可重跑的 job system**：每場會議均具備獨立狀態、產物與中間材料，便於重寫、稽核與後續交付
-- **面向長會議的 review workflow**：以切片掃描、問題卡與答案回填機制，降低長逐字稿摘要失真與關鍵資訊誤判的風險
-- **可切換的 AI 整理後端**：支援 `claude`、`codex`、對話 agent，以及 LM Studio / OpenAI-compatible API
-- **文件生成與交付能力**：可輸出逐字稿、會議記錄、待辦事項與 `Markdown / PDF / Word` 等交付格式
-- **可常駐運行的本機部署模式**：透過 `install.sh` 與 `launchd` 建立長期可維運的內部服務
+- **從錄音到交付的一體化流程**：不是把工具拼在一起，而是將上傳、轉寫、review、定稿與交付串成一條可運作的正式生產流程。
+- **以風險控制為核心的 review 設計**：對姓名、術語、數字、金額、日期與矛盾敘述進行主動攔截，降低高風險錯誤直接流入正式文件。
+- **本機優先與資料邊界清楚**：關鍵音檔、逐字稿與中間材料可留在內部工作站處理，避免一開始就把敏感內容外送到第三方雲端服務。
+- **可重跑、可稽核、可持續修訂**：每場會議保留完整 job 狀態與中間材料，後續可依客戶需求、範本調整或資訊修正重新生成文件。
+- **兼顧顧問實務與 AI 自動化**：既能接 `claude`、`codex` 等外部模型，也能切換到 LM Studio 本地模型，讓效率與保密要求可以依情境平衡。
+- **交付物不是附帶功能，而是核心成果**：系統直接面向逐字稿、正式會議記錄、待辦事項與 `Markdown / PDF / Word` 等對外可用成果。
+- **可部署、可常駐、可維運**：透過 `install.sh` 與 `launchd` 落地為內部服務，而不是拋棄式的 demo 指令碼。
 
 ---
 
@@ -24,28 +24,28 @@
 
 | 能力 | 說明 |
 |---|---|
-| **本機優先轉寫** | 音檔在本機完成正規化、ASR、簡轉繁，不依賴 Whisper API 或第三方轉寫 SaaS。 |
-| **講者感知處理** | 以 `sherpa-onnx` + CAM++ zh 執行聲紋分群，並支援 headcount-aware fallback。 |
-| **長會議穩定性** | 大型逐字稿可自動切片、平行掃描，避免單次 prompt 對長內容的靜默失敗。 |
-| **互動式 review** | 將姓名、術語、金額與矛盾敘述整理成可點選回答的問題卡，降低錯誤進入正式文件。 |
-| **雙 AI 運作模式** | 一般模式可接 Claude / Codex；保密模式可接 LM Studio 本機模型。 |
-| **可控模型生命週期** | 內建 private model cleanup 策略：`keep_loaded`、`idle_eject`、`after_job`。 |
-| **多格式交付** | 可輸出 `transcript` 與 `meeting note`，格式支援 `md`、`pdf`、`docx`。 |
-| **可重跑與可稽核** | 保留 source、raw transcript、answers、state，可隨時重寫文件而不必重傳音檔。 |
-| **通知與交付整合** | 支援 `none`、`telegram`、`command`、`webhook` 四種通知模式。 |
+| **本機優先轉寫** | 音檔在本機完成正規化、ASR 與簡轉繁處理，降低對外部轉寫 SaaS 的依賴，讓資料邊界更可控。 |
+| **講者感知處理** | 以 `sherpa-onnx` + CAM++ zh 執行聲紋分群，並保留 headcount-aware fallback，提升多人會議的可用性。 |
+| **長會議穩定性** | 大型逐字稿可切片、平行掃描並分階段處理，避免單次 prompt 對長內容失真或靜默失敗。 |
+| **互動式澄清機制** | 將姓名、術語、數字與矛盾敘述整理為可回答的問題卡，把不確定性留在 review 階段解決，而不是讓錯誤進入定稿。 |
+| **雙 AI 運作模式** | 一般模式可接 Claude / Codex；保密模式可接 LM Studio 本機模型，因應不同資料敏感度。 |
+| **可控模型生命週期** | 內建 private model cleanup 策略：`keep_loaded`、`idle_eject`、`after_job`，兼顧資源效率與作業安全。 |
+| **可重跑與可稽核** | 保留 source、raw transcript、answers、state，使後續修訂、重寫與內部稽核有明確依據。 |
+| **多格式正式交付** | 可輸出 `transcript` 與 `meeting note`，格式支援 `md`、`pdf`、`docx`，直接對接顧問與管理場景的交付需求。 |
+| **通知與流程整合** | 支援 `none`、`telegram`、`command`、`webhook` 四種通知模式，可納入既有內部作業流程。 |
 
 ---
 
-## 產品定位
+## 適用場景
 
-`meeting-scribe` 面向需要在**隱私、準確性與可交付性**之間取得平衡的工作場景：
+`meeting-scribe` 特別適合下列工作情境：
 
-- **顧問、業務、PM 與管理者**：需要將長會議快速整理為可發出的正式記錄與後續行動項目
-- **重視隱私與資料邊界的團隊**：不希望將客戶會議、訪談內容或內部討論送往第三方雲端服務
-- **以 Apple Silicon 為核心的內部工作站**：希望用一台常駐 Mac 建立穩定的會議處理節點
-- **長會議與高風險內容場景**：無法接受模型只讀前半段內容，就產出看似完整但事實不全的摘要
+- **顧問公司與專業服務團隊**：需要把客戶訪談、專案會議與策略討論，整理成可正式對外傳送的會議記錄與行動項目。
+- **重視資料邊界的企業內部團隊**：希望在不犧牲效率的情況下，避免將敏感會議內容預設送往外部雲端服務。
+- **高價值、高風險會議場景**：例如涉及商業判斷、金額、時程承諾、跨部門決策或客戶溝通的會議，不能接受「看起來完整、實際卻有關鍵錯漏」的摘要。
+- **需要持續修訂與版本管理的交付流程**：當會議文件需要依回饋、範本或新資訊反覆調整時，系統必須支援可追溯與可重生成，而非一次輸出後無法回頭。
 
-它不是錄音硬體，也不是公有雲協作平台；它更接近一個可部署於內部環境的**本機會議處理層**。
+它不是錄音硬體，也不是公有雲會議 SaaS。更準確地說，它是一個可部署於內部環境、服務正式交付流程的**會議處理層**。
 
 ---
 
@@ -66,7 +66,7 @@
 
 ### 實測效能
 
-在 Apple Silicon 上，2 小時錄音可在約 **13 分鐘**內完成轉寫，約 **9–10× realtime**。詳細數據與選型比較見 [`BENCHMARK.md`](BENCHMARK.md)。
+在 Apple Silicon 上，2 小時錄音可在約 **13 分鐘**內完成轉寫，約 **9–10× realtime**。這代表它不只是可行概念，而是具備實際營運節奏的處理能力。詳細資料與模型選型比較見 [`BENCHMARK.md`](BENCHMARK.md)。
 
 ---
 
@@ -95,7 +95,7 @@ review pipeline
 Markdown / PDF / Word / action_items / delivery
 ```
 
-這個設計的目的不是「多一段流程」，而是讓系統能穩定處理**長逐字稿、講者錯配、術語歧義、關鍵數字不清**這些真實世界問題。review stage 的設計理由見 [`docs/REVIEW.md`](docs/REVIEW.md)。
+這個設計的重點不在於「流程比較長」，而在於**把高風險的不確定性留在可控制的 review 階段處理**。對正式交付而言，真正昂貴的從來不是多一步確認，而是錯誤地把錯的姓名、錯的金額、錯的判斷寫進客戶文件。review stage 的設計理由見 [`docs/REVIEW.md`](docs/REVIEW.md)。
 
 ---
 
@@ -178,7 +178,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 
 這代表你可以：
 
-- 改模板後重寫同一場會議記錄
+- 改範本後重寫同一場會議記錄
 - 修正姓名或術語後重新產出文件
 - 不重新上傳錄音就重做交付
 
@@ -206,8 +206,8 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 | 模式 | 行為 |
 |---|---|
 | `keep_loaded` | 模型常駐，下一次最快 |
-| `idle_eject` | 閒置 `idle_minutes` 後自動卸載 |
-| `after_job` | 每次保密任務完成後立即卸載 |
+| `idle_eject` | 閒置 `idle_minutes` 後自動釋放模型 |
+| `after_job` | 每次保密任務完成後立即釋放模型 |
 
 系統現在也提供 LM Studio 管理狀態卡，可清楚顯示：
 
@@ -232,7 +232,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 | `asr` | Whisper model、speaker threshold、fallback 行為 |
 | `agent.mode` | `review` / `auto` / `manual` |
 | `agent.profiles` | 一般模式 / 保密模式的模型後端 |
-| `agent.private_cleanup` | 保密模式模型卸載策略 |
+| `agent.private_cleanup` | 保密模式模型釋放策略 |
 
 ### 通知模式
 
@@ -285,7 +285,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 | `bin/notify.py` | 對外通知統一出口 |
 | `bin/make_pdf.py` / `bin/make_docx.py` | 文件格式轉換 |
 | `templates/NOTE_SPECS.md` | 會議記錄規格合約 |
-| `templates/SCAN_TASK.md` / `PARTIAL_TASK.md` / `AGENT_TASK.md` | AI 階段指令模板 |
+| `templates/SCAN_TASK.md` / `PARTIAL_TASK.md` / `AGENT_TASK.md` | AI 階段指令範本 |
 
 ---
 
@@ -295,7 +295,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 |---|---|
 | [`docs/AGENT.md`](docs/AGENT.md) | 如何接 Claude / Codex / 對話 agent / LM Studio |
 | [`docs/REVIEW.md`](docs/REVIEW.md) | review stage 的設計原因與失敗保護機制 |
-| [`BENCHMARK.md`](BENCHMARK.md) | 實測速度、記憶體、模型選型數據 |
+| [`BENCHMARK.md`](BENCHMARK.md) | 實測速度、記憶體、模型選型資料 |
 | [`docs/DIARIZATION_RESEARCH.md`](docs/DIARIZATION_RESEARCH.md) | 講者分離研究與條件式 fallback 背景 |
 
 ---
@@ -318,7 +318,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 - `.gitignore` 採 **deny-all + whitelist** 策略，降低誤提交真實會議資料的風險
 - `config.json`、`.token`、`archive/`、`logs/`、`models/`、`.venv/` 不進版控
 - jobs 的「清理產出」只刪除可重生檔案，不刪原始證據與設定材料
-- 保密模式的模型釋放邏輯會避免誤卸載其他工作負載的 foreign loaded model
+- 保密模式的模型釋放邏輯會避免誤釋放其他工作負載的 foreign loaded model
 
 ---
 
