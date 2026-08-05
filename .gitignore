@@ -33,6 +33,10 @@ bin/__pycache__/
 !docs/
 !docs/**
 
+!tests/
+!tests/*.py
+tests/__pycache__/
+
 # --- never, under any circumstance ---
 # (redundant with the deny-all above; kept as a second line of defence)
 archive/
