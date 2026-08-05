@@ -37,6 +37,8 @@
     "agent.max_questions": "Hard cap on the question cards shown to you. Eight is about two minutes of clicking; beyond that people skip the whole screen, which is worse than asking less.",
     "agent.private_cleanup": "What to do after a private-mode LM Studio call finishes. mode=keep_loaded leaves the model in RAM; idle_eject waits idle_minutes then POSTs /api/v1/models/unload; after_job unloads immediately.",
 
+    "integrations.meeting_intel": "Local-first bridge into meeting-intel. When enabled, `python bin/meeting_intel_export.py <job>` writes a validated ingest bundle to the watch folder; auto_export_on_done also drops one there automatically after a successful write stage.",
+
     "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale."
   },
 
@@ -116,5 +118,13 @@
     "suggest_archive_days": 30,
     "suggest_clean_days": 60,
     "suggest_delete_days": 180
+  },
+
+  "integrations": {
+    "meeting_intel": {
+      "enabled": false,
+      "watch_dir": "~/meeting-intel/watch/meeting-scribe",
+      "auto_export_on_done": false
+    }
   }
 }

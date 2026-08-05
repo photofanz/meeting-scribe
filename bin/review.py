@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chunker  # noqa: E402
 import jobstate  # noqa: E402
 import notify as notifier  # noqa: E402
+from meeting_intel_export import maybe_auto_export  # noqa: E402
 from agent_note import (  # noqa: E402
     DOC_KINDS,
     FMT_NAME,
@@ -802,6 +803,13 @@ def finish(job: Job, deliver: bool) -> dict:
 
     if deliver:
         notify_done(job, report)
+    if report["ok"]:
+        try:
+            exported = maybe_auto_export(job.dir, cfg=CONFIG)
+            if exported:
+                print(f"[review] exported meeting-intel bundle -> {exported}")
+        except Exception as exc:  # noqa: BLE001 - integration failures must not hide the meeting outputs
+            print(f"[review] meeting-intel export skipped: {type(exc).__name__}: {exc}")
     if backend_is_api(job.backend) and report["ok"]:
         schedule_cleanup(job.acfg, job_id=job.dir.name, stage="write")
     return report

@@ -137,6 +137,15 @@ DEFAULTS: dict = {
         "suggest_clean_days": 60,
         "suggest_delete_days": 180,
     },
+    "integrations": {
+        "meeting_intel": {
+            # Local-first bridge: export a completed meeting-scribe job as a
+            # meeting-intel ingest bundle into the watched folder.
+            "enabled": False,
+            "watch_dir": str((ROOT.parent / "meeting-intel" / "watch" / "meeting-scribe").resolve()),
+            "auto_export_on_done": False,
+        },
+    },
 }
 
 
