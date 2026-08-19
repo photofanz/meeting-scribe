@@ -626,6 +626,69 @@ def run_agent(cmd: list[str], log_path: Path, timeout: int) -> tuple[int, str]:
 
 
 # --------------------------------------------------------------------------- #
+# post-write cleanup
+# --------------------------------------------------------------------------- #
+
+# Stems whose prose is allowed to carry transcript timestamps. transcript_clean
+# IS a transcript; interview notes quote verbatim and the spec asks for marks so
+# a researcher can re-listen. Everything else is a document you hand to people.
+TIMESTAMP_OK_STEMS = {"transcript_clean", "note_interview"}
+
+# `[00:12:34]` / `[12:34]`, optionally wrapped in backticks or parens, and runs
+# of them joined by a dash or comma (`[00:02:53]–[00:03:04]`). Anchored on the
+# bracket so ordinary markdown links and footnotes are untouched.
+_TS = r"[（(]?`?\[\d{1,2}:\d{2}(?::\d{2})?\]`?[)）]?"
+_TS_RUN = re.compile(rf"{_TS}(?:\s*[–—~至,、，/-]\s*{_TS})*")
+_FENCE = re.compile(r"^\s*(```|~~~)")
+
+
+def strip_inline_timestamps(text: str) -> tuple[str, int]:
+    """Remove transcript timestamps from note prose.
+
+    The spec forbids them, but a prompt rule is a request; this is the
+    guarantee. Fenced code blocks are skipped — nothing in a note legitimately
+    needs `[00:12:34]` outside one, and inside one it may be sample data.
+    """
+    out: list[str] = []
+    removed = 0
+    in_fence = False
+    for line in text.split("\n"):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence or "[" not in line:
+            out.append(line)
+            continue
+        cleaned, n = _TS_RUN.subn("", line)
+        if n:
+            removed += n
+            # Tidy the holes the removal leaves: doubled spaces, a space that
+            # now sits before punctuation, and brackets emptied of content.
+            cleaned = re.sub(r"[（(]\s*[)）]", "", cleaned)
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+            cleaned = re.sub(r"[ \t]+([。，、；：！？）」』】])", r"\1", cleaned)
+            cleaned = cleaned.rstrip()
+        out.append(cleaned)
+    return "\n".join(out), removed
+
+
+def scrub_note(job_dir: Path, stem: str) -> int:
+    """Rewrite <stem>.md in place without timestamps. Returns how many went."""
+    if stem in TIMESTAMP_OK_STEMS:
+        return 0
+    md = job_dir / f"{stem}.md"
+    try:
+        original = md.read_text()
+    except OSError:
+        return 0
+    cleaned, removed = strip_inline_timestamps(original)
+    if removed:
+        md.write_text(cleaned)
+    return removed
+
+
+# --------------------------------------------------------------------------- #
 # conversion + delivery
 # --------------------------------------------------------------------------- #
 def convert(job_dir: Path, stem: str, fmt: str, result: dict, meta: dict) -> tuple[bool, str]:
@@ -724,6 +787,10 @@ def main() -> int:
         if not md.exists():
             missing.append(f"{stem}.md")
             continue
+        # Before conversion, so the PDF and the Word file inherit the clean md.
+        dropped = scrub_note(job_dir, stem)
+        if dropped:
+            print(f"[agent] SCRUB    {stem}.md: removed {dropped} timestamp(s)")
         for fmt in plan["formats"]:
             if fmt == "md":
                 delivery.append({"stem": stem, "fmt": "md", "path": str(md)})

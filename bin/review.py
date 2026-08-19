@@ -64,6 +64,7 @@ from agent_note import (  # noqa: E402
     read_json,
     resolve_bin,
     scale_contract_block,
+    scrub_note,
 )
 from agent_tools import ToolLoopError, run_tool_loop  # noqa: E402
 from config import CONFIG, ROOT, resolve_agent_config  # noqa: E402
@@ -983,6 +984,10 @@ def finish(job: Job, deliver: bool) -> dict:
         if not md.exists():
             missing.append(f"{stem}.md")
             continue
+        # Before conversion, so the PDF and the Word file inherit the clean md.
+        dropped = scrub_note(job.dir, stem)
+        if dropped:
+            print(f"[review] SCRUB   {stem}.md: removed {dropped} timestamp(s)")
         for fmt in job.plan["formats"]:
             if fmt == "md":
                 delivery.append({"stem": stem, "fmt": "md", "path": str(md)})
