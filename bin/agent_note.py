@@ -763,8 +763,53 @@ def strip_process_disclaimers(text: str) -> tuple[str, int]:
     return cleaned, removed
 
 
+# Writing instructions that live in the spec's skeleton headings and get copied
+# into the output verbatim (`## 一、本次會議重點（3 句以內）`). Deliberately
+# shape-based, not a keyword list: only counts/limits phrased as a constraint,
+# so a heading that legitimately carries a parenthetical — `### 3. 報價調整
+# （Jim 提出）`, `## 二、議題討論（續）` — is untouched.
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+_UNIT = r"(?:句|字|條|點|項|個|則)"
+_HEADING_INSTRUCTION = re.compile(
+    r"[（(]\s*(?:"
+    rf"\d+\s*{_UNIT}?\s*以[內内下]"
+    rf"|(?:最多|至多|不超過|不多於|至少|最少|不少於)\s*\d+\s*{_UNIT}?"
+    rf"|\d+\s*[-–~至]\s*\d+\s*{_UNIT}"
+    r")\s*[)）]"
+)
+
+
+def strip_heading_instructions(text: str) -> tuple[str, int]:
+    """Drop spec-writing instructions the writer copied into headings.
+
+    The skeleton in NOTE_SPECS.md doubles as both the required structure and
+    the place to note a length limit, so `（3 句以內）` rides along into the
+    delivered document. The spec now says not to; this makes it not happen.
+    Headings only — the same parenthetical inside body prose ("控制在 3 句以內")
+    would be the writer quoting a real instruction someone gave in the meeting.
+    """
+    out: list[str] = []
+    removed = 0
+    in_fence = False
+    for line in text.split("\n"):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence or not _HEADING.match(line):
+            out.append(line)
+            continue
+        cleaned, n = _HEADING_INSTRUCTION.subn("", line)
+        if n:
+            removed += n
+            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).rstrip()
+        out.append(cleaned)
+    return "\n".join(out), removed
+
+
 def scrub_note(job_dir: Path, stem: str) -> int:
-    """Rewrite <stem>.md in place without timestamps or process disclaimers.
+    """Rewrite <stem>.md in place without timestamps, disclaimers or heading
+    instructions.
 
     Returns the total number of things removed. The two exemptions are
     separate concepts: transcript_clean is a transcript and keeps both;
@@ -783,6 +828,10 @@ def scrub_note(job_dir: Path, stem: str) -> int:
     if stem not in DISCLAIMER_OK_STEMS:
         text, n = strip_process_disclaimers(text)
         removed += n
+    # No exemption: a heading is a heading in every document we hand over, and
+    # the transcript's headings carry no counts to strip.
+    text, n = strip_heading_instructions(text)
+    removed += n
     if removed:
         md.write_text(text)
     return removed
