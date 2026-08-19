@@ -249,6 +249,11 @@ def resolve_agent_config(meta: dict | None = None, *, cfg: dict | None = None) -
         out["model"] = profile.get("model")
     if isinstance(profile.get("api"), dict):
         out["api"] = _merge(out["api"], profile["api"])
+    # Tool-loop knobs are per-profile: a local model that supports tool calling
+    # can be driven like the CLI agents rather than as one-shot JSON completion.
+    for key in ("tool_loop", "tool_loop_max_steps"):
+        if key in profile:
+            out[key] = profile[key]
     out["agent_preset"] = preset
     out["agent_preset_label"] = (
         "一般模式（Claude / Codex）" if preset == "general" else "保密模式（LM Studio）"

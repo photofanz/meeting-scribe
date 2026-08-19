@@ -861,6 +861,7 @@ JOBS_PAGE = r"""<!doctype html>
     <select id="lmModel"></select>
     <button class="btn" id="lmLoad">選擇並載入模型</button>
   </div>
+  <div class="adminhint" id="lmPending"></div>
   <div class="row">
     <select id="lmCleanupMode">
       <option value="keep_loaded">keep_loaded：持續保留模型</option>
@@ -874,6 +875,7 @@ JOBS_PAGE = r"""<!doctype html>
   <div class="btnrow">
     <button class="btn" id="lmRefresh">重新整理狀態</button>
     <button class="btn" id="lmEject">立即釋放模型</button>
+    <button class="btn" id="lmEjectForeign">釋放外部模型</button>
   </div>
 </section>
 
@@ -955,23 +957,44 @@ async function withBtn(id, busyText, okText, fn){
     setTimeout(() => { b.disabled = false; if (b.textContent === okText) b.textContent = old; }, 0);
   }
 }
+let LM_SIG = null;          // last rendered option-list signature
 function renderModelOptions(){
   const sel = $('lmModel');
   const models = (LM && LM.available_models) || [];
   if (!models.length){
+    LM_SIG = null;
     sel.innerHTML = '<option value="">（目前抓不到可用模型）</option>';
     sel.disabled = true;
     $('lmLoad').disabled = true;
     return;
   }
   sel.disabled = false;
-  sel.innerHTML = models.map(m => {
-    const label = [m.display_name || m.key, m.params || '', m.loaded ? '已載入' : '', m.key === LM.model ? '目前預設' : '']
-      .filter(Boolean).join(' · ');
-    return '<option value="' + esc(m.key) + '">' + esc(label) + '</option>';
-  }).join('');
-  sel.value = models.some(m => m.key === LM.model) ? LM.model : models[0].key;
+  // The 15s poll used to blow the whole <select> away and force it back to the
+  // configured default, so anything you picked but had not applied yet was
+  // silently reverted mid-click. Rebuild only when the list itself actually
+  // changed, and even then keep whatever you had selected.
+  const sig = JSON.stringify(models.map(m => [m.key, !!m.loaded])) + '|' + (LM.model || '');
+  if (sig !== LM_SIG){
+    const keep = sel.value;
+    sel.innerHTML = models.map(m => {
+      const label = [m.display_name || m.key, m.params || '', m.loaded ? '已載入' : '', m.key === LM.model ? '目前預設' : '']
+        .filter(Boolean).join(' · ');
+      return '<option value="' + esc(m.key) + '">' + esc(label) + '</option>';
+    }).join('');
+    const want = models.some(m => m.key === keep) ? keep
+               : (models.some(m => m.key === LM.model) ? LM.model : models[0].key);
+    sel.value = want;
+    LM_SIG = sig;
+  }
   $('lmLoad').disabled = false;
+  syncPendingHint();
+}
+function syncPendingHint(){
+  const sel = $('lmModel');
+  const pending = LM && sel.value && sel.value !== LM.model;
+  $('lmPending').textContent = pending
+    ? '尚未套用：選單目前是「' + sel.value + '」，設定檔仍是「' + (LM.model || '未設定') + '」，按「選擇並載入模型」才會生效。'
+    : '';
 }
 function syncCleanupForm(){
   const c = (LM && LM.cleanup) || {};
@@ -1000,8 +1023,11 @@ function renderLM(){
     $('lmStatEject').textContent = '—';
     $('lmHint').textContent = '重新整理狀態時會同步抓取 LM Studio 可用模型列表。';
     $('lmModel').innerHTML = '<option value="">讀取中…</option>';
+    LM_SIG = null;
     $('lmModel').disabled = true;
     $('lmLoad').disabled = true;
+    $('lmPending').textContent = '';
+    $('lmEjectForeign').disabled = true;
     $('lmCleanupMode').value = 'idle_eject';
     $('lmIdleMinutes').value = 15;
     $('lmIdleMinutes').disabled = false;
@@ -1040,6 +1066,7 @@ function renderLM(){
     ? '可選 LLM：' + LM.available_count + ' 個；選擇後會更新保密模式預設模型並立即嘗試載入。'
     : '目前沒有抓到可用模型。';
   $('lmEject').disabled = !LM.can_unload_now;
+  $('lmEjectForeign').disabled = !((LM.foreign_loaded_count || 0) && !LM.active_count);
   $('lmSaveCleanup').disabled = false;
   renderModelOptions();
   syncCleanupForm();
@@ -1142,6 +1169,7 @@ async function poll(){
 $('lmCleanupMode').addEventListener('change', () => {
   $('lmIdleMinutes').disabled = $('lmCleanupMode').value !== 'idle_eject';
 });
+$('lmModel').addEventListener('change', syncPendingHint);
 $('lmRefresh').onclick = () => pollLM(true);
 $('lmLoad').onclick = () => withBtn('lmLoad', '載入中…', '已更新 ✓', async () => {
   const model = $('lmModel').value;
@@ -1156,6 +1184,29 @@ $('lmLoad').onclick = () => withBtn('lmLoad', '載入中…', '已更新 ✓', a
   if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
   LM = j.status || LM;
   renderLM();
+  // Selection is saved either way; a load failure is a warning, not a rollback.
+  if (j.load_error) showErr('已將保密模式預設模型存為「' + model + '」，但這次載入失敗：' + j.load_error);
+  else clearErr();
+});
+$('lmEjectForeign').onclick = () => withBtn('lmEjectForeign', '釋放中…', '已送出 ✓', async () => {
+  const list = (LM && LM.foreign_loaded_models) || [];
+  if (!list.length) throw new Error('目前沒有外部載入的模型');
+  const target = list.length === 1
+    ? list[0]
+    : (prompt('要釋放哪一個？目前外部載入：\n' + list.join('\n'), list[0]) || '').trim();
+  if (!target) return;
+  if (!confirm('這會卸載「' + target + '」，它不是本系統載入的，可能有其他人正在使用。確定要釋放嗎？')) return;
+  const r = await fetch(kq('/api/admin/lmstudio/unload'), {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({instance_id: target, confirm: true})
+  });
+  const t = await r.text();
+  let j = {}; try { j = t ? JSON.parse(t) : {}; } catch(_){ }
+  if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+  LM = j.status || LM;
+  renderLM();
+  clearErr();
 });
 $('lmSaveCleanup').onclick = () => withBtn('lmSaveCleanup', '儲存中…', '已儲存 ✓', async () => {
   const mode = $('lmCleanupMode').value;
@@ -1930,7 +1981,16 @@ async def api_admin_lmstudio_select_load(request: Request, k: str = ""):
     current = str(st.get("model") or "").strip()
     current_loaded = current and current in (st.get("loaded_models") or [])
     target_loaded = bool(available[model].get("loaded"))
+
+    # Persist the choice BEFORE touching the GPU. Loading can fail for reasons
+    # that have nothing to do with the choice being wrong (no memory, foreign
+    # workload holding the box), and rolling the selection back on those made
+    # the picker look broken: you chose, it errored, nothing was saved.
+    saved = save_private_model(model)
+
     unload_result = None
+    load_result = None
+    load_error = ""
     try:
         if model != current and current_loaded and st.get("can_unload_now"):
             unload_result = lmstudio_runtime.unload_now(reason=f"switch_model:{current}->{model}")
@@ -1944,20 +2004,32 @@ async def api_admin_lmstudio_select_load(request: Request, k: str = ""):
             }
         else:
             load_result = lmstudio_runtime.load_model(model)
-        saved = save_private_model(model)
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
-        hint = "；可先按『立即釋放模型』再重試" if exc.code >= 500 else ""
-        raise HTTPException(exc.code if 400 <= exc.code < 600 else 502,
-                            f"LM Studio 載入失敗：HTTP {exc.code} {raw[:240]}{hint}")
+        detail = raw.strip()
+        try:
+            body = json.loads(raw)
+            detail = str((body.get("error") or {}).get("message") or raw).strip()
+        except Exception:  # noqa: BLE001
+            pass
+        load_error = f"HTTP {exc.code}：{detail[:400]}"
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"LM Studio 載入失敗：{type(exc).__name__}: {exc}")
+        load_error = f"{type(exc).__name__}: {exc}"
+
+    after = lmstudio_status_payload()
+    if load_error:
+        foreign = [m for m in (after.get("foreign_loaded_models") or []) if m != model]
+        if foreign:
+            load_error += ("；LM Studio 上仍載入著 " + "、".join(foreign)
+                           + "，可用『釋放外部模型』騰出記憶體再重試")
     return {
         "ok": True,
         "saved_model": saved,
+        "loaded": not load_error,
+        "load_error": load_error,
         "unload_result": unload_result,
         "load_result": load_result,
-        "status": lmstudio_status_payload(),
+        "status": after,
     }
 
 
@@ -1978,20 +2050,55 @@ async def api_admin_lmstudio_cleanup(request: Request, k: str = ""):
 
 
 @app.post("/api/admin/lmstudio/unload")
-def api_admin_lmstudio_unload(k: str = ""):
+async def api_admin_lmstudio_unload(request: Request, k: str = ""):
     check(k)
+    body: dict = {}
+    try:
+        raw = await request.body()
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                body = parsed
+    except Exception:  # noqa: BLE001
+        body = {}
+    instance_id = str(body.get("instance_id") or "").strip()
+
     st = lmstudio_status_payload()
     if st.get("active_count"):
         raise HTTPException(409, "仍有保密任務執行中，現在先不卸載模型")
+
+    if instance_id:
+        # Explicit, operator-named target. This is the only path allowed to
+        # touch a model this system did not load, and the caller has to name it
+        # exactly — no blanket "unload everything" button exists.
+        if not body.get("confirm"):
+            raise HTTPException(400, "釋放外部模型需要 confirm=true")
+        loaded = st.get("loaded_models") or []
+        if instance_id not in loaded:
+            raise HTTPException(404, f"LM Studio 目前沒有載入 {instance_id}"
+                                     f"（目前載入：{'、'.join(loaded) or '無'}）")
+        try:
+            result = lmstudio_runtime.unload_instance(instance_id, reason="manual_web_force")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:240]
+            raise HTTPException(502, f"LM Studio 卸載失敗：HTTP {exc.code} {detail}")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"LM Studio 卸載失敗：{type(exc).__name__}: {exc}")
+        return {"ok": True, "forced": True, "result": result,
+                "status": lmstudio_status_payload()}
+
     if not st.get("can_unload_now"):
         if st.get("foreign_loaded_count"):
-            raise HTTPException(409, "目前載入中的不是本系統保密模式目標模型，先不代為卸載其他工作負載")
+            raise HTTPException(409,
+                                "目前載入中的不是本系統保密模式目標模型："
+                                + "、".join(st.get("foreign_loaded_models") or [])
+                                + "；要釋放請改用『釋放外部模型』並指定名稱")
         raise HTTPException(409, "目前沒有可由本系統安全卸載的保密模式模型")
     try:
         result = lmstudio_runtime.unload_now(reason="manual_web")
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"LM Studio 卸載失敗：{type(exc).__name__}: {exc}")
-    return {"ok": True, "result": result, "status": lmstudio_status_payload()}
+    return {"ok": True, "forced": False, "result": result, "status": lmstudio_status_payload()}
 
 
 @app.get("/api/jobs")

@@ -188,6 +188,51 @@ def load_model(model_key: str, acfg: dict | None = None) -> dict:
     return body
 
 
+def preflight(model_key: str, acfg: dict | None = None) -> tuple[bool, str]:
+    """Check a private-mode model can actually serve before a long stage starts.
+
+    Returns (ok, reason). Failures are reported in LM Studio's own words so the
+    caller never has to guess whether the service was down, the model was
+    missing, or the machine simply lacked the memory to load it.
+    """
+    model_key = str(model_key or "").strip()
+    if not model_key:
+        return False, "保密模式未設定模型（agent.profiles.private.model 是空的）"
+
+    try:
+        models = list_models(acfg)
+    except urllib.error.HTTPError as exc:
+        return False, f"LM Studio 回應 HTTP {exc.code}，無法取得模型清單"
+    except Exception as exc:  # noqa: BLE001
+        return False, (f"連不上 LM Studio（{_api_root(acfg)}）："
+                       f"{type(exc).__name__}: {exc}")
+
+    match = next((m for m in models if m["key"] == model_key), None)
+    if match is None:
+        available = ", ".join(m["key"] for m in models[:8]) or "（清單是空的）"
+        return False, (f"LM Studio 上找不到模型 {model_key}。"
+                       f"目前可用：{available}")
+
+    if match.get("loaded"):
+        return True, f"{model_key} 已載入"
+
+    try:
+        load_model(model_key, acfg)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        detail = raw.strip()
+        try:
+            body = json.loads(raw)
+            detail = str((body.get("error") or {}).get("message") or raw).strip()
+        except Exception:  # noqa: BLE001
+            pass
+        return False, f"模型 {model_key} 載入失敗（HTTP {exc.code}）：{detail}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"模型 {model_key} 載入失敗：{type(exc).__name__}: {exc}"
+
+    return True, f"{model_key} 載入成功"
+
+
 def _active_private_jobs() -> list[str]:
     out: list[str] = []
     archive = ROOT / "archive"
@@ -212,6 +257,28 @@ def _active_private_jobs() -> list[str]:
         if state in ACTIVE_STATES:
             out.append(d.name)
     return out
+
+
+def unload_instance(instance_id: str, acfg: dict | None = None, *, reason: str = "") -> dict:
+    """Unload one specific loaded instance, whoever loaded it.
+
+    ``unload_now`` deliberately only touches the configured private-mode model,
+    which deadlocks when a foreign workload is holding the memory we need. This
+    is the explicit, operator-confirmed escape hatch for that case.
+    """
+    instance_id = str(instance_id or "").strip()
+    if not instance_id:
+        raise ValueError("missing instance_id")
+    acfg = acfg or _private_acfg()
+    cfg = cleanup_cfg(acfg)
+    root = _api_root(acfg)
+    payload = json.dumps({"instance_id": instance_id}).encode("utf-8")
+    req = urllib.request.Request(root + cfg["unload_endpoint"], data=payload,
+                                 headers=_auth_headers(acfg), method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        body = json.loads(r.read().decode("utf-8") or "{}")
+    _log(f"force unloaded instance_id={body.get('instance_id') or instance_id} reason={reason}")
+    return {"ok": True, "instance_id": body.get("instance_id") or instance_id, "reason": reason}
 
 
 def unload_now(acfg: dict | None = None, *, reason: str = "") -> dict:

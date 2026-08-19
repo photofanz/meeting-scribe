@@ -57,12 +57,16 @@ from agent_note import (  # noqa: E402
     build_api_writer_prompt,
     build_plan,
     convert,
+    describe_api_error,
     invoke_backend,
+    last_api_error,
     persist_api_writer_result,
     read_json,
     resolve_bin,
 )
+from agent_tools import ToolLoopError, run_tool_loop  # noqa: E402
 from config import CONFIG, ROOT, resolve_agent_config  # noqa: E402
+from lmstudio_runtime import preflight as lm_preflight  # noqa: E402
 from lmstudio_runtime import schedule_cleanup  # noqa: E402
 
 # Every stage takes minutes and the only progress signal is these prints, which
@@ -643,6 +647,15 @@ def confirmed_block(job: Job, res: dict) -> str:
 # stage 2 — write
 # --------------------------------------------------------------------------- #
 def stage_write(job: Job, deliver: bool) -> dict:
+    # Private mode can burn an hour on transcription and cleanup before the
+    # writer discovers the model was never loadable. Check first, fail in
+    # seconds, and quote LM Studio's own reason.
+    if backend_is_api(job.backend) and job.plan.get("want_note"):
+        ok, reason = lm_preflight(job.model, job.acfg)
+        print(f"[review] preflight {'ok' if ok else 'FAILED'}: {reason}")
+        if not ok:
+            raise RuntimeError(f"保密模式無法使用：{reason}")
+
     jobstate.set_state(job.dir, "writing", "撰寫文件")
     res = resolve(job)
 
@@ -713,6 +726,171 @@ def write_materials(job: Job, res: dict, source: Path) -> Path:
     return out
 
 
+WRITER_SYSTEM = (
+    "你是一個會使用工具的文件撰寫 agent。你有 read_file、write_file、list_files 三個工具。"
+    "你必須實際呼叫工具來讀取來源檔案並寫出成品，不能只在對話中描述你要做什麼。"
+    "讀長檔案時用 offset/limit 分段讀完，不要只讀開頭就動筆。"
+    "寫長文件時用 write_file 的 mode=\"append\" 分成多次寫完，"
+    "**不要為了塞進一次回覆而把內容壓縮成摘要**。全部寫完後，用一句話回覆表示完成。"
+)
+
+
+def write_strategy_block(stems: list[str], source_chars: int) -> str:
+    """Segmented-writing instructions, injected only for the tool-calling path.
+
+    A model's single reply is bounded; a meeting note is not. Given one
+    ``write_file`` call per document, a small model trades completeness for
+    fitting in the response — measured at 1.3k characters of note from a 21k
+    character transcript, with every topic marked 未決. Handing it an append
+    mode is only half the fix; it also has to be told the rhythm, or it will
+    keep writing the whole document in one call out of habit.
+    """
+    notes = [f"`{s}.md`" for s in stems] or ["會議記錄"]
+    first = notes[0]
+    return "\n".join([
+        "## 寫作方式：分段寫入（重要）",
+        "",
+        "`write_file` 有兩種 mode：",
+        "",
+        '- `mode="overwrite"`（預設）— 覆蓋整個檔案',
+        '- `mode="append"` — 接在既有內容後面，兩段之間自動空一行',
+        "",
+        f"**你的單次回覆長度有限，但檔案長度沒有限制。**來源約 {source_chars:,} 字，"
+        "會議記錄的內容量要與會議實際討論相稱；把一場會壓成幾行摘要視同失敗。",
+        f"請照下面的節奏寫 {first}（其餘 `.md` 同理）：",
+        "",
+        f'1. `write_file(path="{stems[0] if stems else "note_general"}.md", mode="overwrite")`'
+        " — 先寫「本次會議重點」與「議題討論」的前 2–3 個議題",
+        '2. `write_file(..., mode="append")` — 接著寫下一批議題，一次 2–3 個',
+        "3. 議題有幾個就寫幾個，需要幾次 append 就呼叫幾次，不要合併或省略議題",
+        '4. `write_file(..., mode="append")` — 最後接上「決議事項」之後的所有章節',
+        "",
+        "每次 write_file 都會回報該檔目前的總字元數，用它確認進度；"
+        "不必為了 append 而重讀檔案，也不要重寫已經寫好的段落。",
+        "`action_items.json` 與 `INDEX.md` 各自用 overwrite 一次寫完（JSON 不能 append）。",
+    ])
+
+
+def thin_notes(job_dir: Path, stems: list[str], source_chars: int, acfg: dict) -> list[tuple[str, int, int]]:
+    """Deliverables that exist but are too short to plausibly cover the source.
+
+    Reported as (filename, actual_chars, floor). A missing file is a hard
+    failure; a thin one is not — a genuinely short meeting produces a short
+    note — so this only drives one more continuation round and then a warning.
+
+    The 0.15 default is calibrated against this archive rather than guessed.
+    Six notes written by a CLI agent run 0.22–0.66 of their source transcript;
+    the single-write LM Studio run that prompted this check came in at 0.061.
+    0.15 sits well clear of the lowest good run and still catches the bad one.
+    """
+    ratio = float(acfg.get("note_min_ratio") or 0.15)
+    floor = max(2000, min(15000, int(source_chars * ratio)))
+    out = []
+    for stem in stems:
+        path = job_dir / f"{stem}.md"
+        if not path.is_file():
+            continue
+        size = len(path.read_text(errors="ignore"))
+        if size < floor:
+            out.append((path.name, size, floor))
+    return out
+
+
+def run_writer_tool_loop(job: Job, prompt: str, stems: list[str], source_chars: int = 0) -> None:
+    """Drive a tool-calling API model the same way the CLI agents are driven.
+
+    The model reads the transcript in slices and writes each deliverable with
+    its own ``write_file`` call, so nothing has to survive a single JSON blob.
+    If it stops early we tell it exactly which files are still missing and let
+    it resume, which is what a human would do in a chat window.
+    """
+    required = [f"{s}.md" for s in stems] + ["action_items.json", "INDEX.md"]
+    max_steps = int(job.acfg.get("tool_loop_max_steps") or 60)
+    rounds = 3
+    summary: dict = {}
+    message = prompt
+
+    for attempt in range(1, rounds + 1):
+        try:
+            rc, elapsed, summary = run_tool_loop(
+                message, job.model, job.acfg,
+                job_dir=job.dir,
+                read_roots=[ROOT / "templates"],
+                log_path=job.log,
+                timeout=job.timeout,
+                max_steps=max_steps,
+                system=WRITER_SYSTEM,
+            )
+        except ToolLoopError as exc:
+            raise RuntimeError(f"寫作階段呼叫推論服務失敗：{exc}") from exc
+
+        print(
+            f"[review] tool loop round {attempt}: rc={rc} steps={summary['steps']} "
+            f"tool_calls={summary['tool_calls']} errors={summary['tool_errors']} "
+            f"wrote={summary['written']} in {elapsed}s"
+        )
+
+        missing = [name for name in required if not (job.dir / name).exists()]
+        # A file can exist and still be unfinished: the failure mode this loop
+        # was built for is a model that stops after one short write_file. Only
+        # a missing file is fatal — a short meeting legitimately yields a short
+        # note — but a thin one is worth one more round of appending.
+        thin = thin_notes(job.dir, stems, source_chars, job.acfg) if source_chars else []
+        if not missing and not thin:
+            break
+        if attempt == rounds:
+            if missing:
+                raise RuntimeError(
+                    "工具迴圈結束後仍缺少檔案：" + "、".join(missing)
+                    + f"（跑了 {attempt} 輪、共 {summary['tool_calls']} 次工具呼叫）"
+                )
+            for name, size, floor in thin:
+                print(f"[review] WARNING {name} 只有 {size:,} 字元（預期至少 {floor:,}）"
+                      f"— 模型在 {rounds} 輪後仍未補足，照現況交付")
+            break
+
+        asks = []
+        if missing:
+            print(f"[review] missing after round {attempt}: {missing} — 要求模型補完")
+            asks.append(
+                "**還缺少下列檔案**，請用 write_file 補齊：\n"
+                + "\n".join(f"- {name}" for name in missing)
+            )
+        if thin:
+            print(f"[review] thin after round {attempt}: "
+                  + "、".join(f"{n} {s:,}<{f:,}" for n, s, f in thin) + " — 要求模型續寫")
+            asks.append(
+                "下列文件**寫得太短，明顯還沒寫完**（來源約 "
+                f"{source_chars:,} 字）：\n"
+                + "\n".join(f"- {n}：目前只有 {s:,} 字元，至少應有 {f:,} 字元" for n, s, f in thin)
+                + "\n\n請用 `write_file(path=..., mode=\"append\")` **接續**寫下去："
+                "把還沒寫到的議題、討論細節、決議與待辦補上。"
+                "**不要用 overwrite 重寫整份**，那會抹掉你已經寫好的內容；"
+                "也不要只是把現有內容換句話說。"
+            )
+        message = (
+            "你上一輪還沒有把工作做完。\n\n"
+            + "\n\n".join(asks)
+            + "\n\n請先用 list_files 確認現況，需要時用 read_file 重讀來源，然後動手補完。\n\n"
+            "原始任務說明如下，規格與禁則一律照舊：\n\n" + prompt
+        )
+
+    # agent_report.json is the agent's own self-report; if it never wrote one we
+    # record what actually happened rather than failing an otherwise good job.
+    report_path = job.dir / "agent_report.json"
+    if not report_path.exists():
+        report_path.write_text(json.dumps({
+            "files": summary.get("written", []),
+            "corrections": 0,
+            "uncertain": [],
+            "notes": "模型未自行產出 agent_report.json，此檔由工具迴圈依實際寫入結果補上。",
+        }, ensure_ascii=False, indent=2))
+
+    sizes = {name: (job.dir / name).stat().st_size for name in required}
+    print("[review] tool loop deliverables: "
+          + "、".join(f"{n} {s:,}B" for n, s in sizes.items()))
+
+
 def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
     stems = [s for s in job.plan["stems"] if s != "transcript_clean"]
     lines = [f"- `{s}.md` — {DOC_KINDS[s][0]}" for s in stems]
@@ -720,6 +898,14 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
     lines.append("- `INDEX.md` — 檔案清單與機密層級")
 
     confirmed = confirmed_block(job, res)
+    source_chars = len(source.read_text(errors="ignore"))
+
+    # An API backend whose model supports tool calling is driven exactly like
+    # the CLI agents: same AGENT_TASK.md discipline, real read/write tools. The
+    # segmented-writing block only makes sense there — the CLI agents' Write
+    # tool has no append mode — so it is resolved before the template is filled.
+    use_tool_loop = backend_is_api(job.backend) and bool(job.acfg.get("tool_loop"))
+
     prompt = fill(T_WRITE, {
         "ROOT": ROOT, "JOB_DIR": job.dir, "SPEC_PATH": SPEC_PATH,
         "SOURCE_DESC": source_desc, "TRANSCRIPT_PATH": source,
@@ -728,7 +914,8 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
         "DURATION": hms(job.result.get("duration")),
         "PARTICIPANTS": job.f("participants", "未提供"),
         "NUM_SPEAKERS": job.result.get("num_speakers") or "?",
-        "TRANSCRIPT_CHARS": f"{len(source.read_text(errors='ignore')):,}",
+        "TRANSCRIPT_CHARS": f"{source_chars:,}",
+        "WRITE_STRATEGY": write_strategy_block(stems, source_chars) if use_tool_loop else "",
         # Labels are already resolved in the text, so re-warning the writer
         # about diarisation would only make it hedge names it can trust.
         "SPEAKER_WARNING": "" if res["speaker_map"] else job.speaker_warning,
@@ -736,7 +923,9 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
         "DELIVERABLES": "\n".join(lines),
     }) + "\n" + job.user_context
 
-    if backend_is_api(job.backend):
+    # Models without tool support fall back to asking for every deliverable
+    # inside a single JSON envelope.
+    if backend_is_api(job.backend) and not use_tool_loop:
         prompt = build_api_writer_prompt(
             job.dir,
             job.meta,
@@ -750,9 +939,23 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
         )
 
     (job.work / "write_prompt.md").write_text(prompt)
+
+    if use_tool_loop:
+        run_writer_tool_loop(job, prompt, stems, source_chars)
+        return
+
     rc, elapsed, text = invoke_backend(job.backend, job.binary, prompt, job.model, job.log, job.timeout, job.acfg)
     print(f"[review] writer exited {rc} after {elapsed}s")
     if backend_is_api(job.backend):
+        # A transport failure (model won't load, service down, non-JSON body)
+        # yields an empty string here. Validating that as if it were the model's
+        # answer reports "output invalid" and hides the real cause, so the
+        # transport error always wins.
+        err = last_api_error()
+        if err:
+            msg = describe_api_error(err)
+            print(f"[review] writer transport failure: {msg}")
+            raise RuntimeError(f"寫作階段呼叫推論服務失敗：{msg}")
         ok, why = persist_api_writer_result(job.dir, text, job.plan["stems"])
         if not ok:
             raise RuntimeError(f"API writer output invalid: {why}")

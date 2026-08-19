@@ -152,6 +152,10 @@ def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
         "TRANSCRIPT_CHARS": f"{chars:,}",
         "SPEAKER_WARNING": warning,
         "DELIVERABLES": "\n".join(lines),
+        # Segmented writing is a tool-loop capability (review.py fills this in).
+        # The CLI agents reached from here have no append mode, so it stays blank
+        # rather than leaking an unsubstituted placeholder into the prompt.
+        "WRITE_STRATEGY": "",
         # This entry point skips the review stage entirely, so there is nothing
         # confirmed and the source is always the raw transcript. review.py
         # fills both properly; here they are stated rather than left as
@@ -440,8 +444,72 @@ def _openai_compat_request(prompt: str, model: str | None, acfg: dict) -> tuple[
     return endpoint, url, body, str(api.get("api_key") or "lm-studio")
 
 
+# Transport-level failure detail for the most recent API backend call.
+# _run_openai_compat() can only return an empty string on failure, which callers
+# used to mistake for "the model replied with the wrong shape". Callers should
+# consult last_api_error() before running any schema validation.
+_LAST_API_ERROR: dict | None = None
+
+
+def last_api_error() -> dict | None:
+    """Detail of the last API transport failure, or None if the call succeeded."""
+    return _LAST_API_ERROR
+
+
+def _set_api_error(kind: str, detail: str, *, code: int = 0, url: str = "",
+                   model: str = "") -> None:
+    global _LAST_API_ERROR
+    _LAST_API_ERROR = {
+        "kind": kind,          # http_error | unreachable | not_json | empty
+        "detail": detail.strip(),
+        "code": code,
+        "url": url,
+        "model": model,
+    }
+
+
+def describe_api_error(err: dict | None) -> str:
+    """Human-readable one-liner for an entry produced by _set_api_error()."""
+    if not err:
+        return ""
+    kind = err.get("kind")
+    model = err.get("model") or "?"
+    detail = (err.get("detail") or "").strip()
+    if len(detail) > 600:
+        detail = detail[:600] + "…"
+    if kind == "http_error":
+        return (f"推論服務回應 HTTP {err.get('code')}（model={model}）："
+                f"{detail or '無錯誤內容'}")
+    if kind == "unreachable":
+        return f"無法連線到推論服務 {err.get('url') or '?'}：{detail}"
+    if kind == "not_json":
+        return f"推論服務回傳的內容不是合法 JSON（model={model}）：{detail}"
+    if kind == "empty":
+        return f"推論服務回傳空白內容（model={model}）：{detail}"
+    return detail or "未知的 API 失敗"
+
+
+def _extract_api_error_message(raw: str) -> str:
+    """Pull the human message out of an OpenAI-style error body when possible."""
+    try:
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return raw.strip()
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"]).strip()
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+        if data.get("message"):
+            return str(data["message"]).strip()
+    return raw.strip()
+
+
 def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
                        timeout: int, acfg: dict) -> tuple[int, str, str]:
+    global _LAST_API_ERROR
+    _LAST_API_ERROR = None
     endpoint, url, body, api_key = _openai_compat_request(prompt, model, acfg)
     touch_activity(acfg, event="request")
     started = time.time()
@@ -468,20 +536,28 @@ def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             log.write(f"[agent] HTTPError {exc.code}: {raw[:1200]}\n")
+            _set_api_error("http_error", _extract_api_error_message(raw),
+                           code=exc.code, url=url, model=str(body.get("model") or ""))
             return exc.code, f"{time.time() - started:.1f}", ""
         except Exception as exc:  # noqa: BLE001
             log.write(f"[agent] request failed: {type(exc).__name__}: {exc}\n")
+            _set_api_error("unreachable", f"{type(exc).__name__}: {exc}",
+                           url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
 
         try:
             data = json.loads(raw)
         except Exception as exc:  # noqa: BLE001
             log.write(f"[agent] invalid JSON response: {exc}\n{raw[:1200]}\n")
+            _set_api_error("not_json", f"{exc}｜開頭內容：{raw[:300]}",
+                           code=code, url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
 
         text = _extract_openai_text(data, endpoint)
         if not text:
             log.write(f"[agent] empty text response\n{raw[:1200]}\n")
+            _set_api_error("empty", _extract_api_error_message(raw) or raw[:300],
+                           code=code, url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
 
         log.write(f"[agent] received {len(text)} chars\n")

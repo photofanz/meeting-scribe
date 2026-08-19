@@ -34,6 +34,7 @@
     "agent.chunk_overlap_turns": "How many turns of the previous chunk to show as read-only context, so the reader does not misjudge a sentence that starts mid-thought.",
     "agent.max_parallel": "Concurrent CLI processes. Each is a full model session, so this is bounded by memory and provider rate limits, not CPU cores.",
     "agent.mapreduce_threshold_chars": "Above this transcript size the meeting note is written map-reduce (extract material per chunk, then merge) instead of in one pass. Below it, one pass produces a more coherent document.",
+    "agent.note_min_ratio": "A meeting note shorter than this fraction of its source transcript is treated as unfinished, and the tool-loop writer is asked to append the rest. Notes written by a CLI agent run 0.22-0.66 of source; a local model that tried to fit everything in one reply came in at 0.061. Raise it to demand more depth, lower it if short meetings keep triggering retries.",
     "agent.max_questions": "Hard cap on the question cards shown to you. Eight is about two minutes of clicking; beyond that people skip the whole screen, which is worse than asking less.",
     "agent.private_cleanup": "What to do after a private-mode LM Studio call finishes. mode=keep_loaded leaves the model in RAM; idle_eject waits idle_minutes then POSTs /api/v1/models/unload; after_job unloads immediately.",
 
@@ -105,6 +106,7 @@
     "chunk_overlap_turns": 3,
     "max_parallel": 3,
     "mapreduce_threshold_chars": 60000,
+    "note_min_ratio": 0.15,
     "max_questions": 8,
     "private_cleanup": {
       "mode": "idle_eject",
