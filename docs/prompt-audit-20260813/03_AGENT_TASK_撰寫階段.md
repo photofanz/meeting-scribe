@@ -37,6 +37,8 @@
 4. 依規格產出上列 `.md` 與 `action_items.json`。
 5. 最後寫 `INDEX.md`，逐份標註機密層級。
 
+{{SCALE_CONTRACT}}
+
 {{WRITE_STRATEGY}}
 
 ## 禁則（違反即視為失敗）

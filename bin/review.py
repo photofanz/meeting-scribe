@@ -63,6 +63,7 @@ from agent_note import (  # noqa: E402
     persist_api_writer_result,
     read_json,
     resolve_bin,
+    scale_contract_block,
 )
 from agent_tools import ToolLoopError, run_tool_loop  # noqa: E402
 from config import CONFIG, ROOT, resolve_agent_config  # noqa: E402
@@ -744,6 +745,10 @@ def write_strategy_block(stems: list[str], source_chars: int) -> str:
     character transcript, with every topic marked 未決. Handing it an append
     mode is only half the fix; it also has to be told the rhythm, or it will
     keep writing the whole document in one call out of habit.
+
+    How much to write is not stated here — ``scale_contract_block`` says that,
+    on every path, and this block only explains the mechanics that make it
+    reachable.
     """
     notes = [f"`{s}.md`" for s in stems] or ["會議記錄"]
     first = notes[0]
@@ -756,7 +761,7 @@ def write_strategy_block(stems: list[str], source_chars: int) -> str:
         '- `mode="append"` — 接在既有內容後面，兩段之間自動空一行',
         "",
         f"**你的單次回覆長度有限，但檔案長度沒有限制。**來源約 {source_chars:,} 字，"
-        "會議記錄的內容量要與會議實際討論相稱；把一場會壓成幾行摘要視同失敗。",
+        "上面那條內容量要求靠單次 write_file 是寫不完的，分次寫才寫得到。",
         f"請照下面的節奏寫 {first}（其餘 `.md` 同理）：",
         "",
         f'1. `write_file(path="{stems[0] if stems else "note_general"}.md", mode="overwrite")`'
@@ -916,6 +921,9 @@ def run_writer(job: Job, res: dict, source: Path, source_desc: str) -> None:
         "NUM_SPEAKERS": job.result.get("num_speakers") or "?",
         "TRANSCRIPT_CHARS": f"{source_chars:,}",
         "WRITE_STRATEGY": write_strategy_block(stems, source_chars) if use_tool_loop else "",
+        # Unlike the block above, this one is path-independent: a CLI agent has
+        # no append mode but is just as capable of stopping after two lines.
+        "SCALE_CONTRACT": scale_contract_block(source_chars),
         # Labels are already resolved in the text, so re-warning the writer
         # about diarisation would only make it hedge names it can trust.
         "SPEAKER_WARNING": "" if res["speaker_map"] else job.speaker_warning,

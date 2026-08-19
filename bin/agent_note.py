@@ -111,6 +111,31 @@ def build_plan(meta: dict) -> dict:
     }
 
 
+def scale_contract_block(source_chars: int) -> str:
+    """The one instruction every writer path needs: write at the meeting's scale.
+
+    AGENT_TASK.md is six prohibitions and no floor, so the safest reading of it
+    is a two-line-per-topic stub — which is what a small model actually returns.
+    The segmented-writing block carried the counterweight ("內容量要與會議實際
+    討論相稱"), but that block is tool-loop-only, so the CLI and single-envelope
+    API paths were relying on the model being strong enough to not need telling.
+    The mechanics of appending differ per path; this requirement does not, so it
+    lives on its own and is injected everywhere.
+    """
+    return "\n".join([
+        "## 內容量（硬規格）",
+        "",
+        f"來源約 {source_chars:,} 字。會議記錄的份量要與會議實際討論相稱——"
+        "把一場會壓成幾行摘要視同失敗。",
+        "",
+        "- 逐字稿裡討論到的議題，有幾個就寫幾個；不要為了篇幅合併、跳過，或只留一個標題。",
+        "- 每個議題都要寫到規格要求的深度（討論內容、誰提的、結論與依據），不要一句話帶過。",
+        "- 寫到後段覺得篇幅變長時，該做的是繼續寫完，不是把剩下的議題濃縮成摘要。",
+        "- 這條與「禁則」不衝突：禁則管的是不要編造，這條管的是不要偷懶。"
+        "逐字稿沒講的仍然一律不准寫。",
+    ])
+
+
 def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
     transcript = job_dir / "transcript.md"
     chars = len(transcript.read_text(errors="ignore")) if transcript.exists() else 0
@@ -156,6 +181,9 @@ def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
         # The CLI agents reached from here have no append mode, so it stays blank
         # rather than leaking an unsubstituted placeholder into the prompt.
         "WRITE_STRATEGY": "",
+        # How much to write does not depend on how the file gets written, so
+        # unlike WRITE_STRATEGY this one is filled on every path.
+        "SCALE_CONTRACT": scale_contract_block(chars),
         # This entry point skips the review stage entirely, so there is nothing
         # confirmed and the source is always the raw transcript. review.py
         # fills both properly; here they are stated rather than left as
@@ -273,6 +301,8 @@ def build_api_writer_prompt(job_dir: Path, meta: dict, result: dict, plan: dict,
     parts += [f"- `{name}`" for name in files]
     parts += [
         "",
+        scale_contract_block(len(source_text)),
+        "",
         "## 回傳格式",
         "只回傳一個 JSON 物件，不要加 Markdown code fence，不要加前言、結語或說明文字。格式如下：",
         "```json",
@@ -291,6 +321,11 @@ def build_api_writer_prompt(job_dir: Path, meta: dict, result: dict, plan: dict,
         "- `files` 內只能出現允許輸出的檔名。",
         "- `agent_report.json.files` 要與你實際輸出的檔名一致。",
         "- 不得補寫逐字稿裡沒有的內容；不確定就誠實寫待確認或未討論。",
+        # This path has no append mode: a reply that runs out of room mid-object
+        # parses as nothing at all and the whole job fails. Say where to give way
+        # first, so the length requirement above never costs the entire output.
+        "- 整個 JSON 必須完整閉合。真的寫不下時，先縮減 `action_items.json` 的附屬欄位，"
+        "最後才動議題討論——但絕不可回傳斷在一半的 JSON。",
     ]
     return "\n".join(parts)
 
