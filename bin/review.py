@@ -222,7 +222,9 @@ class Job:
         return (
             f"> ⚠️ **聲紋分群不可靠**：使用者填 {want} 位講者，系統卻切出 {got} 群"
             f"（線上會議錄音常見）。逐字稿的講者標籤不可信，請改用發言內容、人稱與角色"
-            f"重新判斷是誰在講，並在文件開頭註明「講者對應為推測」。"
+            f"重新判斷是誰在講。**這件事不要寫進文件**——把「講者對應為推測」寫進"
+            f"`agent_report.json` 的 `uncertain`，文件裡判不出來的句子不指派給特定人"
+            f"（寫「會中有人提出」）。"
         )
 
     def source_transcript(self) -> Path:
@@ -631,15 +633,16 @@ def confirmed_block(job: Job, res: dict) -> str:
         out.append("")
     if res["speaker_map"]:
         out += ["**逐字稿中的講者標籤已由 Python 直接換成真實姓名**，"
-                "所以你讀到的姓名是確定的，不必再註明「推測」。", ""]
+                "所以你讀到的姓名是確定的，可以直接使用。", ""]
     if res["guessed"]:
-        out += ["**以下是系統推測、使用者尚未確認**——可以採用，但文件開頭必須註明"
-                "「講者對應為推測」，並且不要把推測寫成既成事實：", ""]
+        out += ["**以下是系統推測、使用者尚未確認**——可以採用，但不要把推測寫成既成事實，"
+                "也**不要在文件裡加註明**：把「講者對應為推測」寫進 `agent_report.json` 的"
+                "`uncertain`，文件裡判不出來的句子不指派給特定人（寫「會中有人提出」）：", ""]
         out += [f"- {line}" for line in res["guessed"]]
         out.append("")
     if res["skipped"]:
         out += ["> ⚠️ 使用者選擇「跳過問題」，以上全部是系統推測。"
-                "文件開頭請註明「本文件未經使用者確認關鍵資訊」。", ""]
+                "同樣不要在文件裡註明這件事——寫進 `agent_report.json` 的 `uncertain`。", ""]
     if not res["confirmed"] and not res["guessed"]:
         out += ["（本次沒有需要確認的事項。）", ""]
     return "\n".join(out)
@@ -987,7 +990,7 @@ def finish(job: Job, deliver: bool) -> dict:
         # Before conversion, so the PDF and the Word file inherit the clean md.
         dropped = scrub_note(job.dir, stem)
         if dropped:
-            print(f"[review] SCRUB   {stem}.md: removed {dropped} timestamp(s)")
+            print(f"[review] SCRUB   {stem}.md: removed {dropped} timestamp(s)/disclaimer(s)")
         for fmt in job.plan["formats"]:
             if fmt == "md":
                 delivery.append({"stem": stem, "fmt": "md", "path": str(md)})

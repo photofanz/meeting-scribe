@@ -156,7 +156,9 @@ def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
             warning = (
                 f"> ⚠️ **聲紋分群不可靠**：使用者填 {declared} 位講者，系統卻切出 {num_speakers} 群"
                 f"（線上會議錄音常見）。逐字稿的 speaker 標籤不可信，請改用發言內容、人稱與角色"
-                f"重新判斷是誰在講，並在文件開頭註明「講者對應為推測」。"
+                f"重新判斷是誰在講。**這件事不要寫進文件**——把「講者對應為推測」寫進"
+                f"`agent_report.json` 的 `uncertain`，文件裡判不出來的句子不指派給特定人"
+                f"（寫「會中有人提出」）。"
             )
     except (TypeError, ValueError):
         pass
@@ -192,8 +194,9 @@ def build_prompt(job_dir: Path, meta: dict, result: dict, plan: dict) -> str:
         "CONFIRMED": (
             "## 已確認事實\n\n"
             "（本次未經使用者確認流程，沒有任何已確認事實——"
-            "講者姓名、專有名詞、金額日期一律依逐字稿推斷，"
-            "並在文件開頭註明「講者對應為推測」。）\n"
+            "講者姓名、專有名詞、金額日期一律依逐字稿推斷。"
+            "**不要在文件裡註明這件事**：把「講者對應為推測」寫進 `agent_report.json` 的"
+            "`uncertain`，判不出來的句子不指派給特定人。）\n"
         ),
     }
 
@@ -634,6 +637,12 @@ def run_agent(cmd: list[str], log_path: Path, timeout: int) -> tuple[int, str]:
 # a researcher can re-listen. Everything else is a document you hand to people.
 TIMESTAMP_OK_STEMS = {"transcript_clean", "note_interview"}
 
+# Stems allowed to describe how the pipeline works. Only the transcript: its
+# spec genuinely asks for a "講者對應為推測" header, because that file is a
+# working document, not a deliverable. Interview notes are handed to people
+# like every other note, so they keep their timestamps but lose disclaimers.
+DISCLAIMER_OK_STEMS = {"transcript_clean"}
+
 # `[00:12:34]` / `[12:34]`, optionally wrapped in backticks or parens, and runs
 # of them joined by a dash or comma (`[00:02:53]–[00:03:04]`). Anchored on the
 # bracket so ordinary markdown links and footnotes are untouched.
@@ -673,18 +682,109 @@ def strip_inline_timestamps(text: str) -> tuple[str, int]:
     return "\n".join(out), removed
 
 
+# Vocabulary that only shows up when the writer is explaining our pipeline to
+# the reader. Split in two because the risk is not symmetric.
+#
+# _PROCESS_ALWAYS: phrases nobody says in a meeting. They exist to disclaim the
+# document itself, so they are internal wherever they appear — including inside
+# 「」, since the prompts used to literally ask for 註明「講者對應為推測」.
+#
+# _PROCESS_UNQUOTED: real technical vocabulary. A consultant demoing this very
+# tool could say "聲紋分群" out loud, and a verbatim quote of that is content,
+# not a disclaimer. These only count when they appear outside 「」/『』/"" —
+# i.e. when the note is speaking in its own voice about how it was made.
+_PROCESS_ALWAYS = (
+    "講者對應為推測", "講者對應係推測", "講者對應仍為推測",
+    "逐句歸屬", "未經使用者確認",
+)
+_PROCESS_UNQUOTED = (
+    "聲紋分群", "聲紋群", "講者標籤", "speaker 標籤", "speaker標籤",
+    "依內容推斷", "依內容推測",
+)
+_QUOTED = re.compile(r"「[^」]*」|『[^』]*』|“[^”]*”|\"[^\"]*\"")
+_BLOCKQUOTE = re.compile(r"^\s{0,3}>")
+
+
+def _is_process_disclaimer(block: str) -> bool:
+    if any(term in block for term in _PROCESS_ALWAYS):
+        return True
+    bare = _QUOTED.sub("", block)
+    return any(term in bare for term in _PROCESS_UNQUOTED)
+
+
+def strip_process_disclaimers(text: str) -> tuple[str, int]:
+    """Remove blockquotes that explain the pipeline instead of the meeting.
+
+    A note is handed to attendees and clients. How the diarisation clustered,
+    how speaker attribution was inferred, what the system could not resolve —
+    that belongs in agent_report.json's `uncertain`, which the user sees in the
+    completion notice, not in the document. The spec says so; this makes it so.
+
+    Scope is deliberately narrow to avoid eating content: only blockquote
+    blocks (`>`-prefixed runs), never body prose, never fenced code. A quote of
+    something an attendee said survives — see _PROCESS_UNQUOTED. Returns the
+    text and how many blocks went.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    removed = 0
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence or not _BLOCKQUOTE.match(line):
+            out.append(line)
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and _BLOCKQUOTE.match(lines[j]):
+            j += 1
+        block = "\n".join(lines[i:j])
+        if _is_process_disclaimer(block):
+            removed += 1
+        else:
+            out.extend(lines[i:j])
+        i = j
+
+    if not removed:
+        return text, 0
+
+    # Tidy the hole: a removed block leaves behind the blank lines that framed
+    # it — as a doubled gap mid-document, a blank first line when the
+    # disclaimer sat under the title, or a trailing gap when it sat last.
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip("\n")
+    if text.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, removed
+
+
 def scrub_note(job_dir: Path, stem: str) -> int:
-    """Rewrite <stem>.md in place without timestamps. Returns how many went."""
-    if stem in TIMESTAMP_OK_STEMS:
-        return 0
+    """Rewrite <stem>.md in place without timestamps or process disclaimers.
+
+    Returns the total number of things removed. The two exemptions are
+    separate concepts: transcript_clean is a transcript and keeps both;
+    note_interview keeps its timestamps but is still a deliverable, so its
+    disclaimers go.
+    """
     md = job_dir / f"{stem}.md"
     try:
         original = md.read_text()
     except OSError:
         return 0
-    cleaned, removed = strip_inline_timestamps(original)
+    text, removed = original, 0
+    if stem not in TIMESTAMP_OK_STEMS:
+        text, n = strip_inline_timestamps(text)
+        removed += n
+    if stem not in DISCLAIMER_OK_STEMS:
+        text, n = strip_process_disclaimers(text)
+        removed += n
     if removed:
-        md.write_text(cleaned)
+        md.write_text(text)
     return removed
 
 
@@ -761,8 +861,9 @@ def main() -> int:
             (
                 "## 已確認事實\n\n"
                 "（本次未經使用者確認流程，沒有任何已確認事實——"
-                "講者姓名、專有名詞、金額日期一律依逐字稿推斷，"
-                "並在文件開頭註明「講者對應為推測」。）\n"
+                "講者姓名、專有名詞、金額日期一律依逐字稿推斷。"
+                "**不要在文件裡註明這件事**：把「講者對應為推測」寫進 `agent_report.json` 的"
+                "`uncertain`，判不出來的句子不指派給特定人。）\n"
             ),
             (f"## 使用者提供的背景／專有名詞\n\n{(meta.get('context') or '').strip()}\n"
              if (meta.get("context") or "").strip() else ""),
@@ -790,7 +891,7 @@ def main() -> int:
         # Before conversion, so the PDF and the Word file inherit the clean md.
         dropped = scrub_note(job_dir, stem)
         if dropped:
-            print(f"[agent] SCRUB    {stem}.md: removed {dropped} timestamp(s)")
+            print(f"[agent] SCRUB    {stem}.md: removed {dropped} timestamp(s)/disclaimer(s)")
         for fmt in plan["formats"]:
             if fmt == "md":
                 delivery.append({"stem": stem, "fmt": "md", "path": str(md)})
