@@ -176,28 +176,55 @@ def display_name(name: str, client: str = "", title: str = "", meeting_date: str
     return "_".join(parts + [name])
 
 
-def list_files(d: Path, client: str = "", title: str = "", meeting_date: str = "") -> list[dict]:
-    """User-facing deliverables in a stable order, newest content first."""
-    order = {"transcript_clean": 0, "note_general": 1, "note_client": 2,
-             "note_self": 3, "note_partner": 4, "note_interview": 5,
-             "email_draft": 6, "action_items": 7, "INDEX": 8, "transcript": 9}
+# The download panel is an allowlist, not a denylist. A denylist loses by
+# default: the job directory is also the pipeline's scratch space, so every
+# intermediate it learns to write (transcript.json, transcript_draft.md,
+# INDEX.md, action_items.json) shows up as a "deliverable" until someone
+# remembers to exclude it by name. These are the documents a person asked for.
+# Note this is deliberately NOT the same list as OUTPUT_GLOBS / cleanup_plan():
+# cleanup has to reach every intermediate, which is the opposite job.
+DELIVERABLE_ORDER = {"transcript_clean": 0, "note_general": 1, "note_client": 2,
+                     "note_self": 3, "note_partner": 4, "note_interview": 5,
+                     "email_draft": 6}
+
+
+def list_files(d: Path, client: str = "", title: str = "", meeting_date: str = "",
+               formats: list[str] | None = None) -> list[dict]:
+    """User-facing deliverables in a stable order, newest content first.
+
+    `formats` is the user's format selection from `meta.json`. `.md` is always
+    written because it is the source for both PDF and Word, so a job that asked
+    for PDF only still has `note_general.md` sitting on disk; it belongs in the
+    archive, not in the download list. A deliverable whose every format was
+    filtered out falls back to `.md`, which keeps an md-only document like
+    `email_draft.md` — and any job whose PDF step failed — from vanishing.
+    """
     fmt_order = {"md": 0, "pdf": 1, "docx": 2, "json": 3, "txt": 4}
-    out = []
+    wanted = {f for f in (formats or []) if f} or None
+
+    by_stem: dict[str, list[Path]] = {}
     for p in sorted(d.iterdir()):
         if not p.is_file() or p.name.startswith("."):
             continue
-        if p.name in ("meta.json", "status.json", "state.json", "delivery.json",
-                      "questions.json", "answers.json", "agent_report.json"):
+        stem, _, _ext = p.name.rpartition(".")
+        if stem not in DELIVERABLE_ORDER:
             continue
-        if p.name.startswith("source."):
-            continue
-        stem, _, ext = p.name.rpartition(".")
-        out.append({
-            "name": p.name, "stem": stem, "fmt": ext, "size": p.stat().st_size,
-            "mtime": p.stat().st_mtime,
-            "display_name": display_name(p.name, client=client, title=title, meeting_date=meeting_date),
-            "_k": (order.get(stem, 50), fmt_order.get(ext, 9)),
-        })
+        by_stem.setdefault(stem, []).append(p)
+
+    out = []
+    for stem, paths in by_stem.items():
+        keep = [p for p in paths if wanted is None or p.suffix.lstrip(".") in wanted]
+        if not keep:
+            keep = [p for p in paths if p.suffix == ".md"]
+        for p in keep:
+            ext = p.suffix.lstrip(".")
+            out.append({
+                "name": p.name, "stem": stem, "fmt": ext, "size": p.stat().st_size,
+                "mtime": p.stat().st_mtime,
+                "display_name": display_name(p.name, client=client, title=title,
+                                             meeting_date=meeting_date),
+                "_k": (DELIVERABLE_ORDER[stem], fmt_order.get(ext, 9)),
+            })
     out.sort(key=lambda r: r.pop("_k"))
     return out
 
@@ -254,6 +281,7 @@ def summary(job_id_or_dir) -> dict:
             client=res.get("client") or meta.get("client") or "",
             title=res.get("title") or meta.get("title") or "未命名會議",
             meeting_date=res.get("date") or meta.get("date") or "",
+            formats=meta.get("formats") or ["pdf", "md"],
         ),
     }
 
