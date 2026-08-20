@@ -623,7 +623,8 @@ def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Tur
 
 
 def render_document(stem: str, meta: dict, evidence: dict, sections: list[dict],
-                    highlights: list[str], by_index: dict[int, Turn]) -> str:
+                    highlights: list[str], by_index: dict[int, Turn],
+                    *, overview_failed: bool = False) -> str:
     """Assemble one deliverable. The skeleton can never be incomplete: it is
     generated here, not remembered by a model."""
     title = str(meta.get("title") or "未命名會議")
@@ -642,6 +643,12 @@ def render_document(stem: str, meta: dict, evidence: dict, sections: list[dict],
         out.append("")
 
         if key == "highlights":
+            if overview_failed:
+                # The fallback list below is derived from the topic headings by
+                # Python, so it is never wrong — but it is also not the summary
+                # anybody asked for, and it reads like one. Say which it is.
+                out += ["- **⚠️ 本節未完成**：撰寫重點的模型呼叫失敗，"
+                        "以下由議題標題與狀態機械列出，未經整理，請人工改寫。", ""]
             out += [f"- {h}" for h in highlights] or ["- （本次會議未整理出重點）"]
 
         elif key == "topics":
@@ -907,8 +914,17 @@ def write_sections(job, evidence: dict, meta: dict, by_index: dict[int, Turn],
     return written
 
 
-def write_overview(job, evidence: dict, sections: list[dict], meta: dict) -> list[str]:
-    """The three-sentence opener, written from the evidence rather than the source."""
+def write_overview(job, evidence: dict, sections: list[dict],
+                   meta: dict) -> tuple[list[str], bool]:
+    """The three-sentence opener, written from the evidence rather than the source.
+
+    Returns the lines and whether the model call failed. The two are separate
+    because the fallback is *good* — headings and statuses, assembled by
+    Python — so "did we get an opener" and "did the writing stage work" stopped
+    being the same question. Reading failure off the returned list said no
+    every time, which made the run report claim a clean stage on a stage that
+    never ran.
+    """
     section_by_id = {s["topic_id"]: s for s in sections}
     rows = []
     for topic in evidence["topics"]:
@@ -928,10 +944,12 @@ def write_overview(job, evidence: dict, sections: list[dict], meta: dict) -> lis
     data = _call(job, prompt, schemas.OVERVIEW, SECTION_SYSTEM, "S5 overview")
     if not data:
         # Deriving it from the decided topics is worse prose but never wrong.
-        return [f"{str((section_by_id.get(t['id']) or {}).get('heading') or t['label'])}"
-                f"：{schemas.STATUS_LABEL[t['status']]}"
-                for t in evidence["topics"][:3]]
-    return [str(h).strip() for h in (data.get("highlights") or [])[:3] if str(h).strip()]
+        print("[private] S5 overview: FAILED — 重點改由議題標題機械列出，文件中已標記")
+        return ([f"{str((section_by_id.get(t['id']) or {}).get('heading') or t['label'])}"
+                 f"：{schemas.STATUS_LABEL[t['status']]}"
+                 for t in evidence["topics"][:3]], True)
+    lines = [str(h).strip() for h in (data.get("highlights") or [])[:3] if str(h).strip()]
+    return lines, False
 
 
 # --------------------------------------------------------------------------- #
@@ -970,14 +988,14 @@ def run(job, res: dict, source: Path) -> dict:
                            f"{job.work}/evidence_raw_*.json")
 
     sections = write_sections(job, evidence, meta, by_index, job.user_context)
-    highlights = write_overview(job, evidence, sections, meta)
-    overview_failed = not highlights
+    highlights, overview_failed = write_overview(job, evidence, sections, meta)
     stems = [s for s in job.plan["stems"] if s != "transcript_clean"]
 
     def emit() -> None:
         for stem in stems:
             (job.dir / f"{stem}.md").write_text(
-                render_document(stem, meta, evidence, sections, highlights, by_index))
+                render_document(stem, meta, evidence, sections, highlights, by_index,
+                                overview_failed=overview_failed))
         (job.dir / "action_items.json").write_text(json.dumps(
             build_action_items(meta, job.result, evidence, sections),
             ensure_ascii=False, indent=2))

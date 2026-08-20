@@ -474,6 +474,38 @@ class StageFailureTests(unittest.TestCase):
                                   sections, ["重點"], self.by_index)
         self.assertEqual(text.count("本節未完成"), len(self.evidence["topics"]))
 
+    # -- S5 ---------------------------------------------------------------- #
+    def test_a_failed_opener_is_reported_as_failed(self):
+        """The fallback opener is good, which is exactly why it hides the failure.
+
+        Losing the model call leaves a list of topic headings assembled by
+        Python — never wrong, and never the summary anyone asked for. Because
+        that list is non-empty, reading failure off the returned value said the
+        stage succeeded every time, and the run report's s5_overview counter
+        could not have gone above zero.
+        """
+        self.patch_call([None])
+        lines, failed = pp.write_overview(self.job, self.evidence, [], self.meta)
+        self.assertTrue(failed)
+        self.assertTrue(lines, "the fallback opener should still be written")
+
+    def test_a_written_opener_is_not_reported_as_failed(self):
+        self.patch_call([{"highlights": ["報價定為十二萬含稅。"]}])
+        lines, failed = pp.write_overview(self.job, self.evidence, [], self.meta)
+        self.assertFalse(failed)
+        self.assertEqual(lines, ["報價定為十二萬含稅。"])
+
+    def test_a_mechanical_opener_says_so_in_the_document(self):
+        text = pp.render_document("note_general", self.meta, self.evidence,
+                                  [], ["議題一：待定"], self.by_index,
+                                  overview_failed=True)
+        self.assertIn("本節未完成", text.split("## 二、")[0])
+
+    def test_a_written_opener_adds_no_warning(self):
+        text = pp.render_document("note_general", self.meta, self.evidence,
+                                  [], ["重點"], self.by_index)
+        self.assertNotIn("本節未完成", text.split("## 二、")[0])
+
 
 class ParallelKnobTests(unittest.TestCase):
     """Worker count resolves profile -> global -> 3, and nothing else."""
