@@ -211,6 +211,39 @@ class SplitTests(unittest.TestCase):
         self.assertEqual(pp.split_oversized([topic], by_index, 3000), [topic])
 
 
+class ExcerptTests(unittest.TestCase):
+    """A quotation shows where a conclusion came from; it does not replay the turn."""
+
+    LONG = ("因為目前他們傳給我們，可能都是業務，他們都是用 LINE 傳給我們。"
+            "那我們如果要 key 我們的系統，就是 ERP 系統的話，要先看備註。"
+            "月底結帳的時候我們必須要把醫生名填好，再給財會那邊去算費用。"
+            "這個是目前前端最吃人工的地方，很容易漏算。")
+
+    def test_a_short_turn_is_quoted_whole(self):
+        self.assertEqual(pp.excerpt("那就這樣定了。"), "那就這樣定了。")
+
+    def test_a_long_turn_is_trimmed_to_the_budget(self):
+        out = pp.excerpt(self.LONG, max_chars=60)
+        self.assertLessEqual(len(out), 60)
+        self.assertIn(out, pp.squash(self.LONG))
+
+    def test_the_excerpt_follows_what_the_section_is_about(self):
+        """The model's paraphrase steers the cut without supplying any text."""
+        out = pp.excerpt(self.LONG, focus="月底結帳要回填醫生名給財會算費用", max_chars=60)
+        self.assertIn("醫生名", out)
+        self.assertNotIn("LINE", out)
+
+    def test_every_excerpt_stays_an_exact_substring(self):
+        for focus in ("", "ERP 系統", "漏算", "業務用 LINE 傳"):
+            with self.subTest(focus=focus):
+                out = pp.excerpt(self.LONG, focus=focus, max_chars=60)
+                self.assertIn(out, pp.squash(self.LONG))
+
+    def test_a_turn_with_no_sentence_breaks_is_still_bounded(self):
+        out = pp.excerpt("字" * 500, max_chars=60)
+        self.assertEqual(len(out), 60)
+
+
 class SpecFragmentTests(unittest.TestCase):
     def test_only_this_document_type_and_the_bans_are_handed_over(self):
         frag = pp.spec_fragment("general")
@@ -262,6 +295,13 @@ class RenderTests(unittest.TestCase):
         text = self.doc()
         self.assertIn("### 1. 報價金額拍板", text)
         self.assertIn("### 2. 交期待工廠確認", text)
+
+    def test_quotes_do_not_swallow_the_whole_turn(self):
+        long_turn = "**[00:10:00] 王總**\n\n" + "這是一句很長的話。" * 40
+        turns = turns_of(TRANSCRIPT + "\n" + long_turn)
+        by_index = {t.index: t for t in turns}
+        quote = pp.quote_for(by_index[max(by_index)])
+        self.assertLessEqual(len(quote["text"]), pp.QUOTE_MAX_CHARS)
 
     def test_quotes_are_verbatim_substrings_of_the_source(self):
         text = self.doc()

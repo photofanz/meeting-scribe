@@ -186,9 +186,51 @@ def squash(text: str) -> str:
     return re.sub(r"[\s\u3000]+", " ", str(text or "")).strip()
 
 
-def quote_for(turn: Turn, *, with_stamp: bool = False) -> dict:
+# A quotation should show which sentence the conclusion came from, not replay
+# the turn. Real turns in this archive run 377–853 characters, and quoting them
+# whole both buries the point and inflates the output/source ratio the eval
+# measures — a note can look thorough purely by transcribing.
+QUOTE_MAX_CHARS = 160
+
+# Sentence boundaries in Chinese, keeping the delimiter with its sentence so a
+# rejoined run is still a byte-exact substring of the turn.
+_SENTENCE = re.compile(r"[^。！？!?]*[。！？!?]|[^。！？!?]+")
+
+
+def excerpt(text: str, focus: str = "", max_chars: int = QUOTE_MAX_CHARS) -> str:
+    """The most relevant *contiguous* run of sentences that fits.
+
+    Contiguous is the whole trick: any window of consecutive sentences is
+    still an exact substring of the turn, so trimming a quotation cannot
+    change it. Which window is chosen is decided by overlap with `focus` —
+    the model's own paraphrase of the point being made — so the model steers
+    the selection without ever handing back a character of transcript.
+    """
+    text = squash(text)
+    if len(text) <= max_chars:
+        return text
+    sentences = [s for s in _SENTENCE.findall(text) if s.strip()]
+    if not sentences:
+        return text[:max_chars]
+
+    best, best_key = sentences[0][:max_chars], (-1.0, 0, 0)
+    for start in range(len(sentences)):
+        window = ""
+        for end in range(start, len(sentences)):
+            candidate = window + sentences[end]
+            if len(candidate) > max_chars:
+                break
+            window = candidate
+            key = (label_similarity(focus, window) if focus else 0.0,
+                   len(window), -start)
+            if key > best_key:
+                best, best_key = window, key
+    return best.strip()
+
+
+def quote_for(turn: Turn, *, with_stamp: bool = False, focus: str = "") -> dict:
     """One quotation, cut from the transcript by index rather than retyped."""
-    text = squash(chunker._LEADING_TS.sub("", turn.text))
+    text = excerpt(chunker._LEADING_TS.sub("", turn.text), focus)
     return {
         "turn": turn.index,
         "stamp": turn.stamp,
@@ -524,17 +566,22 @@ def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Tur
     lines.append(f"- **結論**：{schemas.STATUS_LABEL[status]}"
                  + (f"——{basis}" if basis else ""))
 
+    # What the section says it is about, used to pick which sentences of a long
+    # turn actually get quoted.
+    focus = " ".join([str(section.get("basis") or "")]
+                     + [str(i.get("point") or "") for i in section.get("discussion") or []])
     quotes = []
-    for raw in (section.get("quote_turns") or [])[:3]:
+    for raw in (section.get("quote_turns") or [])[:2]:
         turn = by_index.get(int(raw)) if isinstance(raw, (int, float)) else None
         if turn is not None and turn.index in set(topic["turns"]) and turn.text.strip():
-            quotes.append(quote_for(turn, with_stamp=with_stamp))
+            quotes.append(quote_for(turn, with_stamp=with_stamp, focus=focus))
     if not quotes:
         # Every topic needs one quotation. Falling back to the longest turn in
         # the topic is arbitrary but honest: it is real text from this topic.
         candidates = [by_index[i] for i in topic["turns"] if i in by_index and by_index[i].text.strip()]
         if candidates:
-            quotes = [quote_for(max(candidates, key=lambda t: len(t.text)), with_stamp=with_stamp)]
+            quotes = [quote_for(max(candidates, key=lambda t: len(t.text)),
+                                with_stamp=with_stamp, focus=focus)]
     if quotes:
         lines.append("")
         lines += [render_quote(q) for q in quotes]
@@ -599,10 +646,11 @@ def render_document(stem: str, meta: dict, evidence: dict, sections: list[dict],
         elif key == "quotes":
             for topic in topics:
                 section = section_by_id.get(topic["id"]) or {}
+                focus = str(section.get("basis") or "")
                 for raw in (section.get("quote_turns") or [])[:2]:
                     turn = by_index.get(int(raw)) if isinstance(raw, (int, float)) else None
                     if turn is not None and turn.text.strip():
-                        out.append(render_quote(quote_for(turn, with_stamp=True)))
+                        out.append(render_quote(quote_for(turn, with_stamp=True, focus=focus)))
                         out.append("")
             if not any(line.startswith(">") for line in out):
                 out.append("- 未討論")
