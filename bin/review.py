@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chunker  # noqa: E402
 import jobstate  # noqa: E402
+import private_pipeline  # noqa: E402
 import schemas  # noqa: E402
 import notify as notifier  # noqa: E402
 from meeting_intel_export import maybe_auto_export  # noqa: E402
@@ -737,15 +738,21 @@ def stage_write(job: Job, deliver: bool) -> dict:
           f"{len(res['speaker_map'])} 位講者確認")
 
     if job.plan["want_note"]:
-        source = clean
-        chars = len(source.read_text(errors="ignore"))
-        threshold = int(job.acfg.get("mapreduce_threshold_chars") or 60000)
-        if chars > threshold:
-            print(f"[review] {chars:,} chars > {threshold:,} → map-reduce")
-            source, desc = write_materials(job, res, source), "分段素材（唯一資料來源）"
+        if uses_evidence_pipeline(job.backend, job.acfg):
+            # Private mode does not share the writer. It never asks the model
+            # what to write — Python extracts, clusters, quotes and assembles,
+            # and the model only fills small strict schemas along the way.
+            private_pipeline.run(job, res, clean)
         else:
-            desc = "定稿逐字稿"
-        run_writer(job, res, source, desc)
+            source = clean
+            chars = len(source.read_text(errors="ignore"))
+            threshold = int(job.acfg.get("mapreduce_threshold_chars") or 60000)
+            if chars > threshold:
+                print(f"[review] {chars:,} chars > {threshold:,} → map-reduce")
+                source, desc = write_materials(job, res, source), "分段素材（唯一資料來源）"
+            else:
+                desc = "定稿逐字稿"
+            run_writer(job, res, source, desc)
 
     return finish(job, deliver)
 
