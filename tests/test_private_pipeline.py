@@ -9,6 +9,7 @@ data in and documents out.
 from pathlib import Path
 import json
 import sys
+import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -420,13 +421,30 @@ class StageFailureTests(unittest.TestCase):
             self.turns, roster=["王總", "李經理"])
 
     def patch_call(self, replies):
-        """`replies` is a list consumed in call order; None means failure."""
-        calls = list(replies)
+        """Stub `_call`. None means failure.
+
+        `replies` is either a list consumed in call order, or a dict keyed by
+        the call's label. Prefer the dict whenever the test asserts *which*
+        unit failed: S2 and S4 dispatch their units to a thread pool, so call
+        order is scheduling order, not topic order, and a list makes the
+        assertion pass or fail on thread timing.
+        """
         seen = []
 
-        def fake_call(job, prompt, schema, system, label):
-            seen.append(label)
-            return calls.pop(0) if calls else None
+        if isinstance(replies, dict):
+            table = dict(replies)
+
+            def fake_call(job, prompt, schema, system, label):
+                seen.append(label)
+                return table.get(label)
+        else:
+            calls = list(replies)
+            lock = threading.Lock()
+
+            def fake_call(job, prompt, schema, system, label):
+                with lock:
+                    seen.append(label)
+                    return calls.pop(0) if calls else None
 
         original = pp._call
         pp._call = fake_call
@@ -441,7 +459,7 @@ class StageFailureTests(unittest.TestCase):
     # -- S2 ---------------------------------------------------------------- #
     def test_a_chunk_that_failed_to_extract_fails_the_whole_job(self):
         """Evidence with a hole in it produces a note nothing downstream can flag."""
-        self.patch_call([EVIDENCE_REPLY, None])
+        self.patch_call({"S2 1/2": EVIDENCE_REPLY, "S2 2/2": None})
         with self.assertRaises(RuntimeError) as caught:
             pp.extract_evidence(self.job, self.chunks(), self.meta)
         self.assertIn("S2", str(caught.exception))
@@ -462,10 +480,17 @@ class StageFailureTests(unittest.TestCase):
     def test_a_topic_the_model_never_wrote_is_flagged_not_skipped(self):
         section_reply = {"heading": "報價金額拍板", "discussion": [], "basis": "拍板",
                          "status": "decided", "quote_turns": [2]}
-        self.patch_call([section_reply, None])
+        topic_ids = [t["id"] for t in self.evidence["topics"]]
+        self.assertEqual(len(topic_ids), 2)
+        # Keyed by label, so the *second topic* fails no matter which call the
+        # pool happens to run first.
+        self.patch_call({f"S4 {topic_ids[0]}": section_reply,
+                         f"S4 {topic_ids[1]}": None})
         sections = pp.write_sections(self.job, self.evidence, self.meta, self.by_index)
         self.assertEqual(len(sections), len(self.evidence["topics"]))
-        self.assertEqual([s.get("failed") for s in sections], [False, True])
+        by_id = {s["topic_id"]: s.get("failed") for s in sections}
+        self.assertEqual(by_id[topic_ids[0]], False)
+        self.assertEqual(by_id[topic_ids[1]], True)
 
     def test_the_failure_reaches_the_rendered_document(self):
         self.patch_call([None, None])
