@@ -96,6 +96,14 @@ DEFAULTS: dict = {
                 #   legacy    the old single writer prompt, kept one version
                 #             for side-by-side comparison.
                 "pipeline": "evidence",
+                # Concurrent requests this profile may have in flight during
+                # the evidence pipeline's map stages (S2 per chunk, S4 per
+                # topic). Deliberately separate from agent.max_parallel: that
+                # one counts CLI subprocesses, each a whole model session
+                # bounded by memory and provider rate limits, while this one
+                # counts HTTP requests into a single LM Studio that batches
+                # them itself. null = fall back to agent.max_parallel.
+                "max_parallel": None,
                 "api": {
                     "base_url": "http://127.0.0.1:1234/v1",
                     "api_key": "lm-studio",
@@ -261,6 +269,12 @@ def resolve_agent_config(meta: dict | None = None, *, cfg: dict | None = None) -
     for key in ("tool_loop", "tool_loop_max_steps", "pipeline"):
         if key in profile:
             out[key] = profile[key]
+    # Concurrency resolves profile -> global -> 3 (the last step happens at the
+    # call sites). `null` means "this profile has no opinion", so a private
+    # profile that says nothing still inherits the global number rather than
+    # silently dropping to one worker.
+    if profile.get("max_parallel"):
+        out["max_parallel"] = int(profile["max_parallel"])
     out["agent_preset"] = preset
     out["agent_preset_label"] = (
         "一般模式（Claude / Codex）" if preset == "general" else "保密模式（LM Studio）"

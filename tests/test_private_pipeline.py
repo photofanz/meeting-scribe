@@ -350,6 +350,21 @@ class RenderTests(unittest.TestCase):
         self.assertIn("報價抓十二萬含稅", body)
         self.assertIn(">", body)   # still quoted, from the longest turn
 
+    def test_a_section_the_model_failed_says_so_in_the_document(self):
+        """An unwritten section must not read as a merely thin one."""
+        self.sections[0] = {"topic_id": "T01", "heading": "報價金額", "discussion": [],
+                            "status": "pending", "basis": "", "quote_turns": [],
+                            "failed": True}
+        body = self.doc().split("### 1.")[1].split("### 2.")[0]
+        self.assertIn("本節未完成", body)
+        self.assertIn("人工補寫", body)
+        # and only that section is marked
+        self.assertNotIn("本節未完成", self.doc().split("### 2.")[1])
+
+    def test_a_section_that_was_written_carries_no_warning(self):
+        self.sections[0]["failed"] = False
+        self.assertNotIn("本節未完成", self.doc())
+
     def test_a_pipe_in_the_content_cannot_break_a_table(self):
         self.sections[0]["basis"] = "A|B 兩案"
         row = [l for l in self.doc().split("\n") if l.startswith("| 1 |")][0]
@@ -370,6 +385,134 @@ class RenderTests(unittest.TestCase):
         text = self.doc()
         self.assertIn("## 三、決議事項", text)
         self.assertIn("本次會議未產生明確決議", text)
+
+
+class FakeJob:
+    """The four attributes the model-facing stages actually read."""
+
+    def __init__(self, work: Path, max_parallel=None):
+        self.work = work
+        self.acfg = {"max_parallel": max_parallel} if max_parallel else {}
+        self.backend, self.binary, self.model = "openai_compat", "", "test-model"
+        self.log, self.timeout = work / "agent.log", 60
+        self.user_context = ""
+
+
+class StageFailureTests(unittest.TestCase):
+    """What happens to the document when a model call comes back empty.
+
+    `_call` returns None on a timeout, an unparseable reply or a schema
+    mismatch, and raising the worker count makes all three more likely. The
+    contract tested here is that neither failure can reach a reader as a
+    complete-looking note.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.job = FakeJob(Path(self.tmp.name))
+        self.turns = turns_of()
+        self.by_index = {t.index: t for t in self.turns}
+        self.meta = {"title": "報價會議", "meeting_type": "general"}
+        self.evidence = pp.merge_evidence(
+            [(chunk_of(self.turns, set(range(5))), EVIDENCE_REPLY)],
+            self.turns, roster=["王總", "李經理"])
+
+    def patch_call(self, replies):
+        """`replies` is a list consumed in call order; None means failure."""
+        calls = list(replies)
+        seen = []
+
+        def fake_call(job, prompt, schema, system, label):
+            seen.append(label)
+            return calls.pop(0) if calls else None
+
+        original = pp._call
+        pp._call = fake_call
+        self.addCleanup(lambda: setattr(pp, "_call", original))
+        return seen
+
+    def chunks(self, n=2):
+        half = len(self.turns) // 2
+        return [chunker.Chunk(index=0, turns=self.turns[:half]),
+                chunker.Chunk(index=1, turns=self.turns[half:])][:n]
+
+    # -- S2 ---------------------------------------------------------------- #
+    def test_a_chunk_that_failed_to_extract_fails_the_whole_job(self):
+        """Evidence with a hole in it produces a note nothing downstream can flag."""
+        self.patch_call([EVIDENCE_REPLY, None])
+        with self.assertRaises(RuntimeError) as caught:
+            pp.extract_evidence(self.job, self.chunks(), self.meta)
+        self.assertIn("S2", str(caught.exception))
+        self.assertIn("2", str(caught.exception))   # which chunk
+
+    def test_every_chunk_failing_also_fails_the_job(self):
+        self.patch_call([None, None])
+        with self.assertRaises(RuntimeError):
+            pp.extract_evidence(self.job, self.chunks(), self.meta)
+
+    def test_all_chunks_extracting_is_not_a_failure(self):
+        self.patch_call([EVIDENCE_REPLY, EVIDENCE_REPLY])
+        parts = pp.extract_evidence(self.job, self.chunks(), self.meta)
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(data for _, data in parts))
+
+    # -- S4 ---------------------------------------------------------------- #
+    def test_a_topic_the_model_never_wrote_is_flagged_not_skipped(self):
+        section_reply = {"heading": "報價金額拍板", "discussion": [], "basis": "拍板",
+                         "status": "decided", "quote_turns": [2]}
+        self.patch_call([section_reply, None])
+        sections = pp.write_sections(self.job, self.evidence, self.meta, self.by_index)
+        self.assertEqual(len(sections), len(self.evidence["topics"]))
+        self.assertEqual([s.get("failed") for s in sections], [False, True])
+
+    def test_the_failure_reaches_the_rendered_document(self):
+        self.patch_call([None, None])
+        sections = pp.write_sections(self.job, self.evidence, self.meta, self.by_index)
+        text = pp.render_document("note_general", self.meta, self.evidence,
+                                  sections, ["重點"], self.by_index)
+        self.assertEqual(text.count("本節未完成"), len(self.evidence["topics"]))
+
+
+class ParallelKnobTests(unittest.TestCase):
+    """Worker count resolves profile -> global -> 3, and nothing else."""
+
+    def cfg(self, agent: dict) -> dict:
+        return {"agent": agent}
+
+    def resolve(self, agent: dict) -> int:
+        import config as config_mod
+        acfg = config_mod.resolve_agent_config({"agent_preset": "private"},
+                                               cfg=self.cfg(agent))
+        return max(1, int(acfg.get("max_parallel") or 3))
+
+    def test_the_private_profile_knob_wins(self):
+        self.assertEqual(self.resolve({"max_parallel": 3,
+                                       "profiles": {"private": {"max_parallel": 8}}}), 8)
+
+    def test_a_profile_with_no_opinion_inherits_the_global(self):
+        self.assertEqual(self.resolve({"max_parallel": 5,
+                                       "profiles": {"private": {"max_parallel": None}}}), 5)
+        self.assertEqual(self.resolve({"max_parallel": 5, "profiles": {"private": {}}}), 5)
+
+    def test_neither_set_falls_back_to_three(self):
+        self.assertEqual(self.resolve({"profiles": {"private": {}}}), 3)
+
+    def test_the_cli_path_is_not_moved_by_the_private_knob(self):
+        """agent.max_parallel counts CLI processes; private counts HTTP requests."""
+        import config as config_mod
+        agent = {"max_parallel": 3, "backend": "claude",
+                 "profiles": {"private": {"max_parallel": 8}}}
+        general = config_mod.resolve_agent_config({"agent_preset": "general"},
+                                                  cfg=self.cfg(agent))
+        self.assertEqual(general["max_parallel"], 3)
+
+    def test_the_shipped_default_keeps_the_two_knobs_separate(self):
+        import config as config_mod
+        defaults = config_mod.DEFAULTS["agent"]
+        self.assertEqual(defaults["max_parallel"], 3)
+        self.assertIn("max_parallel", defaults["profiles"]["private"])
 
 
 if __name__ == "__main__":

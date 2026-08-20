@@ -36,6 +36,7 @@
     "integrations.meeting_intel": "Local-first bridge into meeting-intel. When enabled, `python bin/meeting_intel_export.py <job>` writes a validated ingest bundle to the watch folder; auto_export_on_done also drops one there automatically after a successful write stage.",
     "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale.",
     "agent.profiles.private.pipeline": "'evidence' (default) runs the local pipeline: Python chunks the transcript, the model fills strict json_schema forms per chunk, and Python does the clustering, quoting, assembly and verification. Quotations are cut from the transcript by index, never retyped by the model. 'legacy' is the old single-prompt writer, kept one version for comparison.",
+    "agent.profiles.private.max_parallel": "How many requests the evidence pipeline may have in flight against LM Studio at once (S2 one per chunk, S4 one per topic). Separate from agent.max_parallel on purpose: that one counts CLI subprocesses, each a whole model session bounded by memory and provider rate limits, while this one counts HTTP requests into a single server that batches them itself. Resolution order: this key, then agent.max_parallel, then 3; null means this profile has no opinion. Raising it past the point where the server saturates buys no throughput and only makes per-request latency — and therefore timeouts, which silently cost you evidence — worse. Measure before changing it.",
     "agent.profiles.private.tool_loop": "Only meaningful with pipeline=legacy. The evidence pipeline needs no tool calling, which is why it can use models LM Studio marks trained_for_tool_use=false."
   },
   "port": 8765,
@@ -94,6 +95,7 @@
           "max_output_tokens": 8192
         },
         "pipeline": "evidence",
+        "max_parallel": null,
         "tool_loop": false
       }
     },

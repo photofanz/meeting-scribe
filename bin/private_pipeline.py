@@ -552,6 +552,13 @@ def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Tur
     """One `###` section: the model's prose, the Python skeleton, real quotes."""
     heading = str(section.get("heading") or topic["label"]).strip() or topic["label"]
     lines = [f"### {index}. {heading}", ""]
+    if section.get("failed"):
+        # The evidence below is real and was extracted successfully; what is
+        # missing is the pass that turns it into prose. Say so in the document
+        # itself, because a reader cannot tell an unwritten section from a
+        # thin one, and an unmarked hole is one nobody fills.
+        lines += ["- **⚠️ 本節未完成**：撰寫這一節的模型呼叫失敗，"
+                  "以下為抽取階段留下的原始重點，尚未整理，請人工補寫。", ""]
 
     rows = []
     used: set[int] = set()
@@ -831,7 +838,24 @@ def extract_evidence(job, chunks: list[Chunk], meta: dict,
             json.dumps(data, ensure_ascii=False, indent=2) if data else "null")
         return chunk, data
 
-    return _parallel(job, chunks, run_one)
+    parts = _parallel(job, chunks, run_one)
+    failed = [c.index + 1 for c, data in parts if not data]
+    print(f"[private] S2 evidence: {total - len(failed)}/{total} chunk(s) ok, "
+          f"{len(failed)} failed")
+    if failed:
+        # A dropped chunk is invisible in the finished note: the pipeline still
+        # emits a complete-looking document, just one built on a transcript
+        # with a hole in it, and the only trace is a slightly worse
+        # output/source ratio. Everything after this stage — topics, actions,
+        # numbers, the verifier's topic count — is derived from this evidence,
+        # so there is nothing downstream that could notice. Raising here is the
+        # difference between a job that failed and a job that lied.
+        raise RuntimeError(
+            f"[private] S2 證據抽取失敗：{len(failed)}/{total} chunk 沒有結果"
+            f"（chunk {', '.join(str(i) for i in failed)}）——"
+            f"整份逐字稿缺一塊，不繼續產出。請檢查 {job.work}/evidence_raw_*.json 與 "
+            f"{job.log}")
+    return parts
 
 
 def write_sections(job, evidence: dict, meta: dict, by_index: dict[int, Turn],
@@ -864,15 +888,23 @@ def write_sections(job, evidence: dict, meta: dict, by_index: dict[int, Turn],
         if data is None:
             # A failed section still gets a section: the evidence for it is
             # already extracted, so the topic appears with its points rather
-            # than vanishing from the document.
+            # than vanishing from the document. It is also *labelled* — an
+            # unwritten section that looks merely thin is a section nobody
+            # goes back to fix.
             data = {"heading": topic["label"], "discussion": [], "basis": "",
-                    "status": topic["status"], "quote_turns": []}
+                    "status": topic["status"], "quote_turns": [], "failed": True}
+        else:
+            data["failed"] = False
         data["topic_id"] = topic["id"]
         (job.work / f"section_{topic['id']}.json").write_text(
             json.dumps(data, ensure_ascii=False, indent=2))
         return data
 
-    return _parallel(job, topics, run_one)
+    written = _parallel(job, topics, run_one)
+    failed = [s["topic_id"] for s in written if s.get("failed")]
+    print(f"[private] S4 sections: {len(written) - len(failed)}/{len(written)} ok, "
+          f"{len(failed)} failed" + (f" ({', '.join(failed)})" if failed else ""))
+    return written
 
 
 def write_overview(job, evidence: dict, sections: list[dict], meta: dict) -> list[str]:
@@ -939,6 +971,7 @@ def run(job, res: dict, source: Path) -> dict:
 
     sections = write_sections(job, evidence, meta, by_index, job.user_context)
     highlights = write_overview(job, evidence, sections, meta)
+    overview_failed = not highlights
     stems = [s for s in job.plan["stems"] if s != "transcript_clean"]
 
     def emit() -> None:
@@ -971,6 +1004,11 @@ def run(job, res: dict, source: Path) -> dict:
     if any(fixed.values()):
         print(f"[private] S6 autofix: {fixed}")
 
+    failed_sections = sorted(str(s.get("topic_id") or "") for s in sections if s.get("failed"))
+    if failed_sections:
+        print(f"[private] ⚠ {len(failed_sections)} section(s) never written: "
+              f"{', '.join(failed_sections)} — 文件中已標記，請人工補寫")
+
     elapsed = time.time() - started
     produced = sum(len((job.dir / f"{s}.md").read_text()) for s in stems
                    if (job.dir / f"{s}.md").exists())
@@ -985,11 +1023,20 @@ def run(job, res: dict, source: Path) -> dict:
         "ratio": round(produced / source_chars, 3) if source_chars else 0.0,
         "elapsed_sec": round(elapsed, 1),
         "dropped": evidence["dropped"],
+        # Which model calls came back empty. S2 failures cannot appear here at
+        # all — they end the job — so this counts what the document is allowed
+        # to ship while incomplete.
+        "failed_sections": failed_sections,
+        "stage_failures": {"s2_chunks": 0, "s4_sections": len(failed_sections),
+                           "s5_overview": int(overview_failed)},
         "autofixed": fixed,
         "findings": [f.as_dict() for f in findings],
         "uncertain": [f"turn {u['turn']}：{u['why']}" for u in evidence["unclear"]][:10],
         "corrections": len(res.get("replacements") or []),
-        "notes": "由 evidence 管線產出：引文與數字皆由 Python 依 turn 編號自逐字稿擷取並驗證。",
+        "notes": ("由 evidence 管線產出：引文與數字皆由 Python 依 turn 編號自逐字稿擷取並驗證。"
+                  + (f"⚠️ 有 {len(failed_sections)} 個議題撰寫失敗"
+                     f"（{', '.join(failed_sections)}），文件中已標記為「本節未完成」，需人工補寫。"
+                     if failed_sections else "")),
     }
     (job.dir / "agent_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2))
