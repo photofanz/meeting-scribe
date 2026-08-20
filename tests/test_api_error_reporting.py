@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -204,3 +205,68 @@ class ConcurrentErrorReportingTests(unittest.TestCase):
                 self.assertIn(f"boom-{slot}", (err or {}).get("detail", ""))
             else:
                 self.assertIsNone(err, f"slot {slot} inherited {err!r}")
+
+
+class ConcurrentLogAttributionTests(unittest.TestCase):
+    """Two calls in flight at once must still be readable apart in the log.
+
+    When S2 gives up it tells the operator to go read this log, and that is the
+    only place the service's own words survive. But every call in a stage
+    appends to the same file, with the same model name, and the request header
+    is flushed at the start while the outcome is written at the end — so with
+    workers in flight the outcome of one call lands under the header of
+    another. The log stays plausible and stops being true, which is the worst
+    way for it to fail. Each call carries an id so its lines can be gathered
+    again.
+    """
+
+    def setUp(self):
+        self.log = Path(tempfile.mkdtemp()) / "agent.log"
+
+    def test_each_calls_lines_can_be_traced_back_to_that_call(self):
+        count = 8
+        entered = threading.Barrier(count)
+        reply_of: dict[int, str] = {}
+
+        def fake_urlopen(req, timeout=None):
+            entered.wait(10)   # hold every call open at once, headers written
+            body = json.loads(req.data.decode("utf-8"))
+            # The prompt is the only thing that differs — same model, as in S4.
+            slot = int(body["messages"][-1]["content"])
+            text = "x" * (100 + slot)
+            reply_of[slot] = text
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": text}}]}).encode("utf-8")
+            resp.status = 200
+            resp.__enter__ = lambda s: resp
+            resp.__exit__ = lambda *a: False
+            return resp
+
+        def worker(slot: int) -> None:
+            agent_note._run_openai_compat(str(slot), "m", self.log, 5, ACFG)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+        with mock.patch.object(agent_note.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+
+        lines = self.log.read_text().splitlines()
+        ids = re.compile(r"\[agent ([^\]]+)\]")
+        by_call: dict[str, list[str]] = {}
+        for line in lines:
+            found = ids.search(line)
+            if found:
+                by_call.setdefault(found.group(1), []).append(line)
+        self.assertEqual(len(by_call), count,
+                         f"expected {count} distinguishable calls, got {sorted(by_call)}")
+        sizes = set()
+        for cid, own in by_call.items():
+            got = [ln for ln in own if "received" in ln]
+            self.assertEqual(len(got), 1, f"call {cid} has {len(got)} outcomes: {own}")
+            sizes.add(int(re.search(r"received (\d+) chars", got[0]).group(1)))
+        self.assertEqual(sizes, {len(t) for t in reply_of.values()},
+                         "an outcome was recorded against the wrong call")

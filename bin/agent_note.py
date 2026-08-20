@@ -26,6 +26,7 @@ half-finished job.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -529,6 +530,19 @@ def _openai_compat_request(prompt: str, model: str | None, acfg: dict, *,
 # thread-local storage keeps the same contract without the interference.
 _ERROR = threading.local()
 
+# Every call in a stage appends to the same log file with the same model name,
+# and its header is written when the request goes out while its outcome is
+# written when the reply lands — so with several in flight the outcome of one
+# call sits under the header of another. S2's failure message sends the
+# operator to this log, so lines that cannot be traced back to a call are
+# lines that mislead. The id makes each call's lines gatherable again.
+_CALL_SEQ = itertools.count(1)
+
+
+def _call_id() -> str:
+    return f"{os.getpid()}.{next(_CALL_SEQ):04d}"
+
+
 
 def last_api_error() -> dict | None:
     """Detail of this thread's last API transport failure, None if it succeeded."""
@@ -604,9 +618,10 @@ def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
     )
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    cid = _call_id()
     with open(log_path, "a") as log:
-        log.write(f"\n===== {time.strftime('%F %T')} :: openai_compat =====\n")
-        log.write(f"[agent] endpoint={endpoint} url={url} model={body.get('model')} timeout={timeout}s\n")
+        log.write(f"\n===== {time.strftime('%F %T')} :: openai_compat [{cid}] =====\n")
+        log.write(f"[agent {cid}] endpoint={endpoint} url={url} model={body.get('model')} timeout={timeout}s\n")
         log.flush()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -614,12 +629,12 @@ def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
                 code = getattr(resp, "status", 200)
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
-            log.write(f"[agent] HTTPError {exc.code}: {raw[:1200]}\n")
+            log.write(f"[agent {cid}] HTTPError {exc.code}: {raw[:1200]}\n")
             _set_api_error("http_error", _extract_api_error_message(raw),
                            code=exc.code, url=url, model=str(body.get("model") or ""))
             return exc.code, f"{time.time() - started:.1f}", ""
         except Exception as exc:  # noqa: BLE001
-            log.write(f"[agent] request failed: {type(exc).__name__}: {exc}\n")
+            log.write(f"[agent {cid}] request failed: {type(exc).__name__}: {exc}\n")
             _set_api_error("unreachable", f"{type(exc).__name__}: {exc}",
                            url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
@@ -627,19 +642,19 @@ def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
         try:
             data = json.loads(raw)
         except Exception as exc:  # noqa: BLE001
-            log.write(f"[agent] invalid JSON response: {exc}\n{raw[:1200]}\n")
+            log.write(f"[agent {cid}] invalid JSON response: {exc}\n{raw[:1200]}\n")
             _set_api_error("not_json", f"{exc}｜開頭內容：{raw[:300]}",
                            code=code, url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
 
         text = _extract_openai_text(data, endpoint)
         if not text:
-            log.write(f"[agent] empty text response\n{raw[:1200]}\n")
+            log.write(f"[agent {cid}] empty text response\n{raw[:1200]}\n")
             _set_api_error("empty", _extract_api_error_message(raw) or raw[:300],
                            code=code, url=url, model=str(body.get("model") or ""))
             return 1, f"{time.time() - started:.1f}", ""
 
-        log.write(f"[agent] received {len(text)} chars\n")
+        log.write(f"[agent {cid}] received {len(text)} chars\n")
         return code, f"{time.time() - started:.1f}", text
 
 
