@@ -21,6 +21,17 @@ ACTIVITY_FILE = RUNTIME_DIR / "lmstudio_last_used.json"
 LOG_FILE = ROOT / "logs" / "lmstudio-cleanup.log"
 ACTIVE_STATES = {"scanning", "writing"}
 
+# A capability verdict can pass and still be worth saying out loud. Callers key
+# off this prefix instead of re-deriving the judgement from the model metadata.
+CAPABILITY_WARN = "⚠️ "
+
+# The writer feeds a whole cleaned transcript (a two-hour meeting runs ~21k
+# 中文 chars, and Chinese is roughly one token per char) plus the note spec,
+# and then needs room for its own answer. 32k is the smallest window where that
+# fits without silent truncation — below it the model drops the tail of the
+# transcript and nobody finds out until the note is short.
+WRITER_MIN_CTX = 32768
+
 
 def _merge(base: dict, over: dict) -> dict:
     out = dict(base)
