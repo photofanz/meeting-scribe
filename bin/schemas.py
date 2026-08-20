@@ -46,7 +46,11 @@ def _arr(items: dict) -> dict:
 
 _STR = {"type": "string"}
 _INT = {"type": "integer"}
-_INT_OR_NULL = {"type": ["integer", "null"]}
+# Nullable as `anyOf`, not as `"type": ["integer", "null"]`. LM Studio's
+# constrained decoder rejects the array form outright — HTTP 400,
+# "'type' must be a string" — and it does so at the first token, so the
+# whole stage fails rather than degrading.
+_INT_OR_NULL = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
 
 # 已決議 / 待定 / 保留, in the wire form the pipeline stores. NOTE_SPECS.md
 # renders them in Chinese; keeping the enum ASCII means a model that drifts on
@@ -183,6 +187,12 @@ def validate(data, schema: dict, path: str = "$") -> list[str]:
     Returns a list of human-readable problems; empty means valid.
     """
     out: list[str] = []
+    if schema.get("anyOf"):
+        for branch in schema["anyOf"]:
+            if not validate(data, branch, path):
+                return []
+        return [f"{path}: 不符合任何一個 anyOf 分支"]
+
     types = schema.get("type")
     types = [types] if isinstance(types, str) else list(types or [])
 

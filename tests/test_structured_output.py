@@ -149,6 +149,18 @@ class SchemaShapeTests(unittest.TestCase):
         problems = schemas.validate(bad, schemas.SCAN)
         self.assertTrue(any("speakers[0].confidence" in p for p in problems), problems)
 
+    def test_nullable_is_spelled_anyOf_because_lm_studio_rejects_the_array_form(self):
+        """`"type": ["integer", "null"]` -> HTTP 400, "'type' must be a string".
+
+        It fails at the first token, so the whole extraction stage dies rather
+        than degrading. Measured against LM Studio on 2026-08-20.
+        """
+        node = schemas.EVIDENCE["properties"]["topics"]["items"]["properties"]["status_turn"]
+        self.assertEqual(node, {"anyOf": [{"type": "integer"}, {"type": "null"}]})
+        self.assertEqual(schemas.validate(None, node), [])
+        self.assertEqual(schemas.validate(14, node), [])
+        self.assertTrue(schemas.validate("14", node))
+
     def test_validator_accepts_a_nullable_integer(self):
         ev = {"topics": [{"topic_id": "t1", "label": "報價", "turns": [3],
                           "status": "pending", "status_turn": None, "speakers": []}],

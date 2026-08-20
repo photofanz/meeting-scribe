@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sys
 import unittest
 from unittest import mock
@@ -38,3 +39,29 @@ class LMStudioRuntimeStatusTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """The activity file is written from every worker thread in the pipeline."""
+
+    def test_concurrent_writers_do_not_destroy_each_others_temp_file(self):
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "activity.json"
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                errors = [f for f in pool.map(
+                    lambda i: _write(target, i), range(64)) if f]
+            self.assertEqual(errors, [])
+            self.assertTrue(target.exists())
+            # Whoever won, the file is one complete document, never a fragment.
+            self.assertIn("n", json.loads(target.read_text()))
+
+
+def _write(target, i):
+    try:
+        lmstudio_runtime._atomic_json(target, {"n": i})
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return ""

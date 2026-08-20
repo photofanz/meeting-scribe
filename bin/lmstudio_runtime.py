@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,10 +42,22 @@ def _merge(base: dict, over: dict) -> dict:
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
+    """Write JSON atomically, safely, from several threads at once.
+
+    A fixed `.tmp` name is only atomic against a reader. Two writers race each
+    other: both create the same temp file, the first `os.replace` consumes it,
+    and the second raises FileNotFoundError on a path it just wrote. That is
+    not hypothetical — the evidence pipeline runs its chunks in parallel and
+    every one of them touches the activity file, so a whole stage died on
+    bookkeeping. The temp name is per-thread; the replace stays atomic.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    os.replace(tmp, path)
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _log(msg: str) -> None:
