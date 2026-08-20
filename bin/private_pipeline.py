@@ -175,9 +175,20 @@ def normalize_speaker(name: str, roster: list[str], turn: Turn | None) -> tuple[
     return name, False
 
 
+def squash(text: str) -> str:
+    """Collapse whitespace runs. The one normalisation quotes are compared under.
+
+    A turn can span several lines, and a blockquote cannot, so rendering has to
+    join them. Verification therefore compares squashed against squashed —
+    which still catches every edit that matters: 「就這樣定了。」 turning into
+    「就這樣定了.」 fails here exactly as loudly as an invented sentence does.
+    """
+    return re.sub(r"[\s\u3000]+", " ", str(text or "")).strip()
+
+
 def quote_for(turn: Turn, *, with_stamp: bool = False) -> dict:
     """One quotation, cut from the transcript by index rather than retyped."""
-    text = chunker._LEADING_TS.sub("", turn.text).strip()
+    text = squash(chunker._LEADING_TS.sub("", turn.text))
     return {
         "turn": turn.index,
         "stamp": turn.stamp,
@@ -821,7 +832,9 @@ def write_overview(job, evidence: dict, sections: list[dict], meta: dict) -> lis
 # entry point
 # --------------------------------------------------------------------------- #
 def run(job, res: dict, source: Path) -> dict:
-    """S2–S5 for one job. Writes the deliverables into `job.dir`."""
+    """S2–S6 for one job. Writes the deliverables into `job.dir`."""
+    import note_verify   # imported here: note_verify imports this module back
+
     started = time.time()
     meta = dict(job.meta)
     meta.setdefault("title", job.title)
@@ -865,6 +878,25 @@ def run(job, res: dict, source: Path) -> dict:
 
     emit()
 
+    # S6. Only the sections that failed are rewritten — one topic missing from
+    # the document is no reason to spend another six minutes on the other
+    # eleven that came out fine.
+    findings = note_verify.verify(job.dir, evidence, turns, stems=stems)
+    note_verify.report(findings)
+    retry = {f.topic_id for f in findings if f.rerun and f.topic_id}
+    if retry:
+        print(f"[private] S6 rewriting {len(retry)} section(s): {sorted(retry)}")
+        redone = {s["topic_id"]: s for s in
+                  write_sections(job, evidence, meta, by_index, job.user_context, only=retry)}
+        sections = [redone.get(s["topic_id"], s) for s in sections]
+        emit()
+        findings = note_verify.verify(job.dir, evidence, turns, stems=stems)
+        note_verify.report(findings)
+
+    fixed = note_verify.autofix(job.dir, stems)
+    if any(fixed.values()):
+        print(f"[private] S6 autofix: {fixed}")
+
     elapsed = time.time() - started
     produced = sum(len((job.dir / f"{s}.md").read_text()) for s in stems
                    if (job.dir / f"{s}.md").exists())
@@ -879,6 +911,8 @@ def run(job, res: dict, source: Path) -> dict:
         "ratio": round(produced / source_chars, 3) if source_chars else 0.0,
         "elapsed_sec": round(elapsed, 1),
         "dropped": evidence["dropped"],
+        "autofixed": fixed,
+        "findings": [f.as_dict() for f in findings],
         "uncertain": [f"turn {u['turn']}：{u['why']}" for u in evidence["unclear"]][:10],
         "corrections": len(res.get("replacements") or []),
         "notes": "由 evidence 管線產出：引文與數字皆由 Python 依 turn 編號自逐字稿擷取並驗證。",
