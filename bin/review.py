@@ -68,6 +68,8 @@ from agent_note import (  # noqa: E402
 )
 from agent_tools import ToolLoopError, run_tool_loop  # noqa: E402
 from config import CONFIG, ROOT, resolve_agent_config  # noqa: E402
+from lmstudio_runtime import CAPABILITY_WARN, WRITER_MIN_CTX  # noqa: E402
+from lmstudio_runtime import capability_check as lm_capability_check  # noqa: E402
 from lmstudio_runtime import preflight as lm_preflight  # noqa: E402
 from lmstudio_runtime import schedule_cleanup  # noqa: E402
 
@@ -655,7 +657,22 @@ def stage_write(job: Job, deliver: bool) -> dict:
     # Private mode can burn an hour on transcription and cleanup before the
     # writer discovers the model was never loadable. Check first, fail in
     # seconds, and quote LM Studio's own reason.
+    #
+    # Capability before preflight, deliberately: the capability check is one
+    # GET against the model list, while preflight may spend minutes loading
+    # 57 GB of weights that were never going to be usable anyway.
     if backend_is_api(job.backend) and job.plan.get("want_note"):
+        ok, reason = lm_capability_check(
+            job.model,
+            need_tools=bool(job.acfg.get("tool_loop")),
+            need_ctx=WRITER_MIN_CTX,
+            acfg=job.acfg,
+        )
+        print(f"[review] capability {'ok' if ok else 'FAILED'}: {reason}")
+        if not ok:
+            raise RuntimeError(f"保密模式無法使用：{reason}")
+        if reason.startswith(CAPABILITY_WARN):
+            print("[review] 繼續執行，但這個組合已知較慢")
         ok, reason = lm_preflight(job.model, job.acfg)
         print(f"[review] preflight {'ok' if ok else 'FAILED'}: {reason}")
         if not ok:

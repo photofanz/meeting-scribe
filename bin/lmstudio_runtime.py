@@ -199,6 +199,79 @@ def load_model(model_key: str, acfg: dict | None = None) -> dict:
     return body
 
 
+def _alternatives(models: list[dict], *, need_tools: bool, need_ctx: int,
+                  exclude: str = "") -> list[str]:
+    """Models on the *same* machine that would actually do the job.
+
+    A rejection that only says "this model cannot" leaves the operator to go
+    read LM Studio's model list themselves. The whole point of failing in
+    seconds is that the next thing they type is already in the message.
+    """
+    ok = [m for m in models
+          if m["key"] != exclude
+          and (m.get("tool_use") or not need_tools)
+          and int(m.get("max_context_length") or 0) >= need_ctx]
+    # mlx before gguf (measurably faster on Apple silicon), loaded before cold,
+    # then widest context — so the first name offered is the cheapest to adopt.
+    ok.sort(key=lambda m: (m.get("format") == "gguf", not m.get("loaded"),
+                           -int(m.get("max_context_length") or 0)))
+    return [m["key"] for m in ok[:3]]
+
+
+def capability_check(model_key: str, *, need_tools: bool, need_ctx: int,
+                     acfg: dict | None = None) -> tuple[bool, str]:
+    """Verify the model can do the job before an hour of work is spent.
+
+    ``preflight()`` answers "is it loadable"; this answers "is it the right
+    tool", which is the question the private-mode post-mortem actually turned
+    on. A 57 GB BF16 GGUF with ``trained_for_tool_use: false`` loads perfectly
+    and then spends 2,572 seconds producing a 1,272-character note, because it
+    was handed a 60-step tool loop it was never trained for. Metadata LM Studio
+    already publishes says so up front, for the cost of one HTTP GET.
+
+    Returns (ok, reason). A reason prefixed with ``CAPABILITY_WARN`` passes but
+    is worth printing: format is a speed problem, not a correctness one, so it
+    never blocks a job the operator deliberately configured.
+    """
+    model_key = str(model_key or "").strip()
+    if not model_key:
+        return False, "保密模式未設定模型（agent.profiles.private.model 是空的）"
+
+    try:
+        models = list_models(acfg)
+    except urllib.error.HTTPError as exc:
+        return False, f"LM Studio 回應 HTTP {exc.code}，無法取得模型清單"
+    except Exception as exc:  # noqa: BLE001
+        return False, (f"連不上 LM Studio（{_api_root(acfg)}）："
+                       f"{type(exc).__name__}: {exc}")
+
+    match = next((m for m in models if m["key"] == model_key), None)
+    if match is None:
+        available = ", ".join(m["key"] for m in models[:8]) or "（清單是空的）"
+        return False, f"LM Studio 上找不到模型 {model_key}。目前可用：{available}"
+
+    alts = _alternatives(models, need_tools=need_tools, need_ctx=need_ctx,
+                         exclude=model_key)
+    hint = ("；同一台機器上可改用：" + "、".join(alts)) if alts else ""
+
+    if need_tools and not match.get("tool_use"):
+        return False, (f"{model_key} 未受工具呼叫訓練（trained_for_tool_use=false），"
+                       f"這條路徑需要模型自己呼叫 read_file／write_file{hint}")
+
+    ctx = int(match.get("max_context_length") or 0)
+    if ctx < need_ctx:
+        return False, (f"{model_key} 的 context 只有 {ctx:,} token，"
+                       f"這條路徑至少需要 {need_ctx:,}（逐字稿會被無聲截斷）{hint}")
+
+    if str(match.get("format") or "").lower() == "gguf":
+        return True, (f"{CAPABILITY_WARN}{model_key} 是 gguf 格式，"
+                      f"在 Apple silicon 上明顯慢於 mlx{hint}")
+
+    return True, (f"{model_key} 能力檢查通過"
+                  f"（{match.get('format') or '?'} / {ctx:,} ctx / "
+                  f"tools={'✓' if match.get('tool_use') else '✗'}）")
+
+
 def preflight(model_key: str, acfg: dict | None = None) -> tuple[bool, str]:
     """Check a private-mode model can actually serve before a long stage starts.
 
