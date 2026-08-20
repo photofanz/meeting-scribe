@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -519,18 +520,24 @@ def _openai_compat_request(prompt: str, model: str | None, acfg: dict, *,
 # _run_openai_compat() can only return an empty string on failure, which callers
 # used to mistake for "the model replied with the wrong shape". Callers should
 # consult last_api_error() before running any schema validation.
-_LAST_API_ERROR: dict | None = None
+#
+# Per-thread, because the evidence pipeline issues these calls from a thread
+# pool: S2 one per chunk, S4 one per topic. In a module global the detail
+# belongs to whichever call wrote last, so a failed chunk reported a blank
+# reason or a neighbour's HTTP error — and the job that stopped named the wrong
+# cause. Every caller reads this on the thread that made the call, so
+# thread-local storage keeps the same contract without the interference.
+_ERROR = threading.local()
 
 
 def last_api_error() -> dict | None:
-    """Detail of the last API transport failure, or None if the call succeeded."""
-    return _LAST_API_ERROR
+    """Detail of this thread's last API transport failure, None if it succeeded."""
+    return getattr(_ERROR, "value", None)
 
 
 def _set_api_error(kind: str, detail: str, *, code: int = 0, url: str = "",
                    model: str = "") -> None:
-    global _LAST_API_ERROR
-    _LAST_API_ERROR = {
+    _ERROR.value = {
         "kind": kind,          # http_error | unreachable | not_json | empty
         "detail": detail.strip(),
         "code": code,
@@ -580,8 +587,7 @@ def _extract_api_error_message(raw: str) -> str:
 def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
                        timeout: int, acfg: dict, *, schema: dict | None = None,
                        system: str | None = None) -> tuple[int, str, str]:
-    global _LAST_API_ERROR
-    _LAST_API_ERROR = None
+    _ERROR.value = None
     endpoint, url, body, api_key = _openai_compat_request(
         prompt, model, acfg, schema=schema, system=system)
     touch_activity(acfg, event="request")

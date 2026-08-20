@@ -12,6 +12,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
 from pathlib import Path
@@ -132,3 +133,74 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConcurrentErrorReportingTests(unittest.TestCase):
+    """Each thread must read back its own failure, not a neighbour's.
+
+    The evidence pipeline runs S2 chunks and S4 sections in parallel, and every
+    one of those calls reports failures through the same `last_api_error()`.
+    While that detail lived in a module global, a second thread entering
+    `_run_openai_compat` cleared it before the first thread had read it — so a
+    failed chunk printed either a blank reason or somebody else's HTTP error,
+    and the job that stopped told you the wrong thing about why. Raising
+    max_parallel widens that window on every call.
+    """
+
+    def setUp(self):
+        self.log = Path(tempfile.mkdtemp()) / "agent.log"
+
+    def _run(self, count: int, fails: set[int]) -> dict[int, dict | None]:
+        entered = threading.Barrier(count)
+        recorded = threading.Barrier(count)
+        marker_of: dict[int, int] = {}
+        seen: dict[int, dict | None] = {}
+
+        def fake_urlopen(req, timeout=None):
+            slot = marker_of[threading.get_ident()]
+            entered.wait(10)          # every thread is now inside the call
+            if slot in fails:
+                raise _http_error(400, json.dumps({"error": {"message": f"boom-{slot}"}}))
+            body = json.dumps({"choices": [{"message": {"content": f"ok-{slot}"}}]})
+            resp = mock.MagicMock()
+            resp.read.return_value = body.encode("utf-8")
+            resp.status = 200
+            resp.__enter__ = lambda s: resp
+            resp.__exit__ = lambda *a: False
+            return resp
+
+        def worker(slot: int) -> None:
+            marker_of[threading.get_ident()] = slot
+            agent_note._run_openai_compat("p", "m", self.log, 5, ACFG)
+            recorded.wait(10)         # every thread has now recorded its outcome
+            seen[slot] = agent_note.last_api_error()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+        # marker_of must be populated before any fake_urlopen runs, and worker
+        # does that as its first statement, before the barrier lets anyone in.
+        with mock.patch.object(agent_note.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        self.assertEqual(len(seen), count, "a worker thread did not finish")
+        return seen
+
+    def test_every_failing_thread_reads_back_its_own_error(self):
+        count = 16
+        seen = self._run(count, fails=set(range(count)))
+        for slot, err in sorted(seen.items()):
+            self.assertIsNotNone(err, f"slot {slot} lost its error entirely")
+            self.assertIn(f"boom-{slot}", err["detail"],
+                          f"slot {slot} read back {err['detail']!r}")
+
+    def test_a_successful_thread_does_not_inherit_a_neighbours_failure(self):
+        count = 16
+        fails = {i for i in range(count) if i % 2}
+        seen = self._run(count, fails=fails)
+        for slot, err in sorted(seen.items()):
+            if slot in fails:
+                self.assertIn(f"boom-{slot}", (err or {}).get("detail", ""))
+            else:
+                self.assertIsNone(err, f"slot {slot} inherited {err!r}")
