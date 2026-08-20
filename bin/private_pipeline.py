@@ -532,6 +532,21 @@ def spec_fragment(meeting_type: str, spec_path: Path = SPEC_PATH) -> str:
 # --------------------------------------------------------------------------- #
 # rendering (S5, pure Python)
 # --------------------------------------------------------------------------- #
+def _strip_speaker_prefix(point: str, speaker: str) -> str:
+    """Drop a name the model repeated at the head of its own point.
+
+    Attribution is rendered from the turn, so a point that begins 「講者1表示…」
+    comes out as 「講者1：講者1表示…」. The prompt asks the model not to write
+    names; this is what happens when it does anyway, which on a real run was
+    every single bullet.
+    """
+    point = str(point or "").strip()
+    speaker = str(speaker or "").strip()
+    if speaker and point.startswith(speaker):
+        point = point[len(speaker):].lstrip("：: ，,、").strip()
+    return point
+
+
 def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Turn],
                  *, with_stamp: bool = False) -> str:
     """One `###` section: the model's prose, the Python skeleton, real quotes."""
@@ -546,7 +561,8 @@ def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Tur
         if not point:
             continue
         speaker = turn.speaker if (turn is not None and turn.speaker) else ""
-        rows.append(f"  - {speaker}：{point}" if speaker else f"  - {point}")
+        point = _strip_speaker_prefix(point, speaker)
+        rows.append(f"  - {speaker}：{point}" if speaker and point else f"  - {point or speaker}")
         if turn is not None:
             used.add(turn.index)
 
@@ -560,7 +576,8 @@ def render_topic(section: dict, topic: dict, index: int, by_index: dict[int, Tur
                 break
             if point["turn"] in used or not point["gist"]:
                 continue
-            rows.append(f"  - {point['speaker']}：{point['gist']}")
+            rows.append(f"  - {point['speaker']}："
+                        f"{_strip_speaker_prefix(point['gist'], point['speaker'])}")
             used.add(point["turn"])
     if not rows:
         rows = ["  - （音檔不清楚，本議題無法整理出具體討論內容）"]

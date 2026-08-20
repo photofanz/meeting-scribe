@@ -304,6 +304,13 @@ class RenderTests(unittest.TestCase):
         self.assertIn("### 1. 報價金額拍板", text)
         self.assertIn("### 2. 交期待工廠確認", text)
 
+    def test_a_name_the_model_repeated_is_not_printed_twice(self):
+        """Python renders the attribution; 「王總：王總表示…」 is the failure."""
+        self.sections[0]["discussion"] = [{"turn": 0, "point": "王總表示報價抓十二萬"}]
+        body = self.doc().split("### 1.")[1].split("### 2.")[0]
+        self.assertIn("  - 王總：表示報價抓十二萬", body)
+        self.assertNotIn("王總：王總", body)
+
     def test_quotes_do_not_swallow_the_whole_turn(self):
         long_turn = "**[00:10:00] 王總**\n\n" + "這是一句很長的話。" * 40
         turns = turns_of(TRANSCRIPT + "\n" + long_turn)
