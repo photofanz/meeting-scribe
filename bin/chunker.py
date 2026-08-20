@@ -322,6 +322,32 @@ def render_turns(turns: list[Turn]) -> str:
     return "\n".join(render_turn(t) for t in turns).strip() + "\n"
 
 
+# Runs of whitespace inside a turn, collapsed for the indexed view below.
+_WS = re.compile(r"[\s\u3000]+")
+
+
+def render_indexed(turns: list[Turn]) -> str:
+    """One line per turn, prefixed with its `Turn.index`.
+
+    The private pipeline's contract with the local model is that the model
+    answers with turn numbers and never with transcript text — Python does
+    every extraction. That only works if the numbering the model sees is the
+    numbering `parse_transcript` produced, so it is printed literally rather
+    than left to be counted.
+
+    Whitespace inside a turn is collapsed so that one turn is exactly one
+    line: a model asked for "the number at the start of the line" should not
+    have to work out which of five lines owns the index. The collapse is
+    cosmetic — quotations are cut from `Turn.text`, not from this rendering.
+    """
+    out = []
+    for t in turns:
+        body = _WS.sub(" ", _LEADING_TS.sub("", t.text)).strip()
+        speaker = t.speaker or ("（前言）" if t.is_preamble else "未知講者")
+        out.append(f"#{t.index} [{t.stamp}] {speaker}：{body}")
+    return "\n".join(out) + "\n"
+
+
 def chunk_file(path: Path, max_chars: int = 14000, overlap_turns: int = 3) -> list[Chunk]:
     return chunk(parse_transcript(Path(path).read_text(errors="ignore")),
                  max_chars, overlap_turns)

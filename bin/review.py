@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import chunker  # noqa: E402
 import jobstate  # noqa: E402
+import schemas  # noqa: E402
 import notify as notifier  # noqa: E402
 from meeting_intel_export import maybe_auto_export  # noqa: E402
 from agent_note import (  # noqa: E402
@@ -84,6 +85,7 @@ except (AttributeError, ValueError):  # not a real stream (tests, pipes)
 
 SPEC_PATH = ROOT / "templates" / "NOTE_SPECS.md"
 T_SCAN = ROOT / "templates" / "SCAN_TASK.md"
+T_SCAN_PRIVATE = ROOT / "templates" / "SCAN_TASK_PRIVATE.md"
 T_PARTIAL = ROOT / "templates" / "PARTIAL_TASK.md"
 T_WRITE = ROOT / "templates" / "AGENT_TASK.md"
 
@@ -99,6 +101,17 @@ TYPE_LABEL = {
 }
 # The option that means "none of these" — never treated as a real answer.
 OPT_OTHER = "以上皆非／我來補充"
+
+
+def uses_evidence_pipeline(backend: str, acfg: dict) -> bool:
+    """Whether this job takes the local evidence pipeline instead of the writer.
+
+    Private mode stops treating a 27B local model like a cloud agent: no
+    long-range planning, no self-directed tool loop, no "read 20,000 characters
+    and decide what matters". `pipeline: "legacy"` keeps the old path around
+    for one version so the two can be compared on the same job.
+    """
+    return backend_is_api(backend) and str(acfg.get("pipeline") or "evidence") == "evidence"
 
 
 # --------------------------------------------------------------------------- #
@@ -249,12 +262,16 @@ def fill(template: Path, subs: dict) -> str:
 
 
 def call_agent(job: Job, prompt: str, out_path: Path, label: str,
-               retries: int = 1) -> tuple[dict | None, str]:
+               retries: int = 1, schema: dict | None = None) -> tuple[dict | None, str]:
     """Run one scan/material call and read back the JSON it produced.
 
     CLI backends write the file themselves. API backends return the JSON body as
     text and Python persists it to `out_path` before parsing, so downstream
     logic stays identical.
+
+    With a `schema`, the API backend decodes under `json_schema: strict`, which
+    makes the shape a property of the request rather than of the model's mood —
+    so the "please return raw JSON" plea is dropped as noise.
     """
     api_prompt = (
         prompt +
@@ -262,6 +279,8 @@ def call_agent(job: Job, prompt: str, out_path: Path, label: str,
         f"你沒有檔案工具時，請直接回傳原本要寫入 `{out_path}` 的 JSON 物件本體。"
         "不要用 Markdown code fence，不要加任何前後說明文字，只回傳可被 json.loads 解析的 JSON。"
     )
+    if schema:
+        api_prompt = prompt
     for attempt in range(retries + 1):
         if out_path.exists():
             out_path.unlink()
@@ -273,6 +292,7 @@ def call_agent(job: Job, prompt: str, out_path: Path, label: str,
             job.log,
             job.timeout,
             job.acfg,
+            schema=schema if backend_is_api(job.backend) else None,
         )
         if backend_is_api(job.backend) and text:
             out_path.write_text(text)
@@ -313,12 +333,19 @@ def stage_scan(job: Job, deliver: bool) -> dict:
     jobstate.set_state(job.dir, "scanning", f"{len(chunks)} 段")
     total = len(chunks)
     per_chunk = max(2, int(job.acfg.get("max_questions") or 8) // 2)
+    # The private path never asks for the cleaned transcript back. Echoing a
+    # 14,000-character chunk into a JSON string field means output ≈ input,
+    # which overran max_output_tokens on essentially every Chinese chunk and
+    # lost the whole reply to truncation. The find/replace list was always the
+    # real product; Python applies it.
+    evidence = uses_evidence_pipeline(job.backend, job.acfg)
     print(f"[review] scan: {total} chunk(s), {job.backend}, "
-          f"{job.acfg.get('max_parallel', 3)} in parallel")
+          f"{job.acfg.get('max_parallel', 3)} in parallel"
+          f"{' · evidence pipeline (no draft echo)' if evidence else ''}")
 
     def run_one(ch: chunker.Chunk):
         out = job.work / f"scan_{ch.index:02d}.json"
-        prompt = fill(T_SCAN, {
+        prompt = fill(T_SCAN_PRIVATE if evidence else T_SCAN, {
             "TOTAL": total, "INDEX": ch.index + 1,
             "TITLE": job.title, "CLIENT": job.f("client", "—"),
             "DATE": job.f("date"), "PARTICIPANTS": job.f("participants", "未提供"),
@@ -329,13 +356,16 @@ def stage_scan(job: Job, deliver: bool) -> dict:
             "MAX_PER_CHUNK": per_chunk,
             "OUT_PATH": str(out),
             "CONTEXT": chunker.render_turns(ch.overlap_turns) if ch.overlap_turns else "（本段為開頭，無上文）",
-            "BODY": chunker.render_turns(ch.own_turns),
+            "BODY": chunker.render_indexed(ch.own_turns) if evidence else chunker.render_turns(ch.own_turns),
         })
-        data, why = call_agent(job, prompt, out, f"scan {ch.index + 1}/{total}")
+        data, why = call_agent(job, prompt, out, f"scan {ch.index + 1}/{total}",
+                               schema=schemas.SCAN if evidence else None)
+        if data is not None and evidence:
+            hydrate_scan_evidence(data, ch)
         return ch, data, why
 
     results = in_parallel(job, chunks, run_one)
-    merged = merge_scans(job, results)
+    merged = merge_scans(job, results, expect_draft=not evidence)
 
     atomic_write(job.dir / "transcript_draft.md", merged["draft"])
     atomic_write(job.dir / "questions.json", merged["questions_doc"])
@@ -352,7 +382,25 @@ def stage_scan(job: Job, deliver: bool) -> dict:
     return merged
 
 
-def merge_scans(job: Job, results: list) -> dict:
+def hydrate_scan_evidence(data: dict, ch: chunker.Chunk) -> None:
+    """Turn the model's `evidence_turns` into the excerpts a question card shows.
+
+    The model is never allowed to quote the transcript — it answers with turn
+    numbers — so the text a human reads on the question card is cut here, from
+    the turns Python already parsed. An index outside this chunk is dropped
+    rather than guessed at.
+    """
+    by_index = {t.index: t for t in ch.turns}
+    for q in data.get("questions") or []:
+        rows = []
+        for raw in (q.pop("evidence_turns", None) or [])[:2]:
+            turn = by_index.get(int(raw)) if isinstance(raw, (int, float)) else None
+            if turn is not None:
+                rows.append({"timestamp": turn.stamp, "text": turn.text[:400]})
+        q["evidence"] = rows
+
+
+def merge_scans(job: Job, results: list, *, expect_draft: bool = True) -> dict:
     """Fold per-chunk scan output into one draft and one question set.
 
     Two deliberate choices:
@@ -380,7 +428,10 @@ def merge_scans(job: Job, results: list) -> dict:
 
         text = (data.get("draft") or "").strip()
         draft_parts.append(text or chunker.render_turns(ch.own_turns))
-        if not text:
+        # On the private path an absent draft is the contract, not a failure:
+        # the raw turns are the draft and `replacements` is applied to them in
+        # stage 2 by the same re.sub that applies the user's answers.
+        if not text and expect_draft:
             failed.append(ch.index)
 
         for r in data.get("replacements") or []:

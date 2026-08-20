@@ -4,27 +4,23 @@
     "port": "TCP port the upload server listens on. Bound to 0.0.0.0, so keep the machine on Tailscale and off the open internet.",
     "service_label": "launchd label. Also decides the plist filename: ~/Library/LaunchAgents/<service_label>.plist. Must be unique on the machine; reverse-DNS style.",
     "language": "Reserved default transcription language. The per-upload form value wins.",
-
     "notify.mode": "How this machine tells you a job moved on. 'none' (default) = no push at all; read everything at /jobs. 'telegram' = talk to the Bot API directly, no other software needed — run `python bin/notify_setup.py` to fill in the token and chat id. 'command' = shell out to a notifier you already run. 'webhook' = POST signed JSON to your own endpoint.",
     "notify.events": "Which transitions are worth a push. Anything not listed is silent. Valid: transcribing, transcribed, scanning, awaiting_answers, writing, done, error.",
     "notify.telegram": "bot_token from @BotFather, chat_id of the chat to post into. `python bin/notify_setup.py` discovers the chat id for you.",
     "notify.command": "Command template for mode=command. {message} and {files} are substituted AFTER the template is split into argv, so a meeting title containing quotes or spaces can never become an extra argument. {files} expands to one `MEDIA:/abs/path` line per deliverable. If neither placeholder appears, the message is appended as the last argument.",
     "notify.webhook": "url + secret for mode=webhook. The body is signed with HMAC-SHA256 over the exact bytes sent, in the X-MeetingScribe-Signature header as sha256=<hex>.",
-
     "branding.brand_name": "Masthead text printed at the top of every generated PDF.",
     "branding.client_footer": "Footer line on client-facing PDF/Word documents (--kind client).",
     "branding.participants_hint": "Placeholder text in the upload form's participants field.",
-
     "asr.whisper_model": "HuggingFace repo or local path for mlx-whisper. Downloaded on first transcription (~1.5 GB for large-v3-turbo). Use mlx-community/whisper-medium-mlx on a memory-tight machine.",
     "asr.diarization_threads": "ONNX threads for speaker diarization. 4 measured faster than 10 — more threads thrash.",
     "asr.diarization_threshold": "Baseline sherpa auto-clustering threshold. 0.75 is the current measured default.",
     "asr.diarization_max_speakers": "Upper bound used by deterministic fallback candidates when the uploaded form says roughly how many people were present.",
     "asr.diarization_stereo_fallback": "When true, a bad mono baseline on stereo recordings is re-tried with left/right channel candidates before giving up.",
-
     "agent.mode": "What happens once the transcript exists. 'review' (default) = scan the transcript, surface the questions only you can answer at /job/<id>, and write the notes after you answer. 'auto' = scan and write back to back using every best guess, nobody in the loop. 'manual' = stop at the transcript; you press the button.",
     "agent.default_preset": "Which UI option is preselected for a new upload: 'general' (Claude/Codex) or 'private' (LM Studio).",
     "agent.profiles.general": "Backend/model/bin for the UI's '一般模式'. Point this at claude or codex.",
-    "agent.profiles.private": "Backend/model/bin/api for the UI's '保密模式'. Usually backend=openai_compat with your LM Studio server over Tailscale.",
+    "agent.profiles.private": "Backend/model/bin/api for the UI's '保密模式'. Usually backend=openai_compat with your LM Studio server over Tailscale. Pick a model LM Studio reports as mlx with a context of at least 32768 — bin/review.py refuses the job in seconds otherwise, and names the models on your machine that would have worked.",
     "agent.backend": "Legacy flat backend kept for backward compatibility. New installs should prefer agent.profiles.general / private; old configs without profiles still work.",
     "agent.bin": "Full path to the CLI when backend=claude/codex. null = look it up on PATH. Ignored by backend=openai_compat.",
     "agent.model": "Model argument passed through to the CLI/API. null = the backend's own default.",
@@ -37,30 +33,36 @@
     "agent.note_min_ratio": "A meeting note shorter than this fraction of its source transcript is treated as unfinished, and the tool-loop writer is asked to append the rest. Notes written by a CLI agent run 0.22-0.66 of source; a local model that tried to fit everything in one reply came in at 0.061. Raise it to demand more depth, lower it if short meetings keep triggering retries.",
     "agent.max_questions": "Hard cap on the question cards shown to you. Eight is about two minutes of clicking; beyond that people skip the whole screen, which is worse than asking less.",
     "agent.private_cleanup": "What to do after a private-mode LM Studio call finishes. mode=keep_loaded leaves the model in RAM; idle_eject waits idle_minutes then POSTs /api/v1/models/unload; after_job unloads immediately.",
-
     "integrations.meeting_intel": "Local-first bridge into meeting-intel. When enabled, `python bin/meeting_intel_export.py <job>` writes a validated ingest bundle to the watch folder; auto_export_on_done also drops one there automatically after a successful write stage.",
-
-    "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale."
+    "retention": "Housekeeping hints only. Nothing is ever deleted without an explicit click — these numbers just decide what the jobs list flags as stale.",
+    "agent.profiles.private.pipeline": "'evidence' (default) runs the local pipeline: Python chunks the transcript, the model fills strict json_schema forms per chunk, and Python does the clustering, quoting, assembly and verification. Quotations are cut from the transcript by index, never retyped by the model. 'legacy' is the old single-prompt writer, kept one version for comparison.",
+    "agent.profiles.private.tool_loop": "Only meaningful with pipeline=legacy. The evidence pipeline needs no tool calling, which is why it can use models LM Studio marks trained_for_tool_use=false."
   },
-
   "port": 8765,
   "service_label": "com.meetingscribe.uploader",
   "language": "zh",
-
   "notify": {
     "mode": "none",
-    "events": ["awaiting_answers", "done", "error"],
-    "telegram": {"bot_token": "", "chat_id": ""},
+    "events": [
+      "awaiting_answers",
+      "done",
+      "error"
+    ],
+    "telegram": {
+      "bot_token": "",
+      "chat_id": ""
+    },
     "command": "",
-    "webhook": {"url": "", "secret": ""}
+    "webhook": {
+      "url": "",
+      "secret": ""
+    }
   },
-
   "branding": {
     "brand_name": "MEETING NOTES",
     "client_footer": "本文件內容以雙方會議討論為準。",
     "participants_hint": "例：王總、張經理、我"
   },
-
   "asr": {
     "whisper_model": "mlx-community/whisper-large-v3-turbo",
     "diarization_threads": 4,
@@ -68,7 +70,6 @@
     "diarization_max_speakers": 8,
     "diarization_stereo_fallback": true
   },
-
   "agent": {
     "mode": "review",
     "backend": "claude",
@@ -84,14 +85,16 @@
       "private": {
         "backend": "openai_compat",
         "bin": null,
-        "model": "gpt-oss-120b",
+        "model": "qwen3.8-27b-mtplx",
         "api": {
           "base_url": "http://100.85.219.106:1234/v1",
           "api_key": "lm-studio",
           "endpoint": "chat_completions",
           "temperature": 0.1,
-          "max_output_tokens": 16384
-        }
+          "max_output_tokens": 8192
+        },
+        "pipeline": "evidence",
+        "tool_loop": false
       }
     },
     "api": {
@@ -115,13 +118,11 @@
       "allow_unload_all": false
     }
   },
-
   "retention": {
     "suggest_archive_days": 30,
     "suggest_clean_days": 60,
     "suggest_delete_days": 180
   },
-
   "integrations": {
     "meeting_intel": {
       "enabled": false,

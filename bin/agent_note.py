@@ -442,18 +442,39 @@ def _extract_openai_text(payload: dict, endpoint: str) -> str:
         return ""
     msg = (choices[0] or {}).get("message") or {}
     content = msg.get("content")
+    text = ""
     if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
+        text = content.strip()
+    elif isinstance(content, list):
         parts = []
         for item in content:
             if isinstance(item, dict) and isinstance(item.get("text"), str):
                 parts.append(item["text"])
-        return "\n".join(parts).strip()
-    return ""
+        text = "\n".join(parts).strip()
+    if text:
+        return text
+    # Some LM Studio model configs classify the *entire* reply as reasoning and
+    # leave `content` empty — measured on qwen3.8-27b-mtplx, which does it even
+    # with thinking disabled and even under a strict json_schema, where the
+    # "reasoning" is the schema-conformant object itself. Reading it as an
+    # empty answer would report "服務回傳空白內容" for a perfectly good reply.
+    # Only consulted when `content` gave nothing, so a normal reasoning model's
+    # scratchpad can never be mistaken for its answer.
+    reasoning = msg.get("reasoning_content")
+    return reasoning.strip() if isinstance(reasoning, str) else ""
 
 
-def _openai_compat_request(prompt: str, model: str | None, acfg: dict) -> tuple[str, str, dict, str]:
+def _openai_compat_request(prompt: str, model: str | None, acfg: dict, *,
+                           schema: dict | None = None,
+                           system: str | None = None) -> tuple[str, str, dict, str]:
+    """Build one OpenAI-compatible request.
+
+    ``schema`` switches the reply from "please answer in JSON" to constrained
+    decoding: LM Studio supports `response_format: json_schema` with
+    `strict: true`, which makes an unparseable or truncated-mid-object answer
+    structurally impossible rather than merely unlikely. The schema's own
+    `title` names it on the wire, so bin/schemas.py stays the single source.
+    """
     api = (acfg.get("api") or {}) if isinstance(acfg, dict) else {}
     base_url = str(api.get("base_url") or "http://127.0.0.1:1234/v1").rstrip("/")
     endpoint = str(api.get("endpoint") or "chat_completions").strip() or "chat_completions"
@@ -461,6 +482,10 @@ def _openai_compat_request(prompt: str, model: str | None, acfg: dict) -> tuple[
     temperature = float(0.1 if temp_val is None else temp_val)
     max_tokens = int(api.get("max_output_tokens") or 16384)
     model_name = model or str(api.get("model") or "").strip() or "openai/gpt-oss-120b"
+    fmt = None
+    if schema:
+        fmt = {"name": str(schema.get("title") or "response"),
+               "strict": True, "schema": schema}
 
     if endpoint == "responses":
         url = f"{base_url}/responses"
@@ -470,15 +495,23 @@ def _openai_compat_request(prompt: str, model: str | None, acfg: dict) -> tuple[
             "temperature": temperature,
             "max_output_tokens": max_tokens,
         }
+        if system:
+            body["instructions"] = system
+        if fmt:
+            body["text"] = {"format": dict(fmt, type="json_schema")}
     else:
         endpoint = "chat_completions"
         url = f"{base_url}/chat/completions"
+        messages = ([{"role": "system", "content": system}] if system else []) + \
+                   [{"role": "user", "content": prompt}]
         body = {
             "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if fmt:
+            body["response_format"] = {"type": "json_schema", "json_schema": fmt}
     return endpoint, url, body, str(api.get("api_key") or "lm-studio")
 
 
@@ -545,10 +578,12 @@ def _extract_api_error_message(raw: str) -> str:
 
 
 def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
-                       timeout: int, acfg: dict) -> tuple[int, str, str]:
+                       timeout: int, acfg: dict, *, schema: dict | None = None,
+                       system: str | None = None) -> tuple[int, str, str]:
     global _LAST_API_ERROR
     _LAST_API_ERROR = None
-    endpoint, url, body, api_key = _openai_compat_request(prompt, model, acfg)
+    endpoint, url, body, api_key = _openai_compat_request(
+        prompt, model, acfg, schema=schema, system=system)
     touch_activity(acfg, event="request")
     started = time.time()
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -603,9 +638,12 @@ def _run_openai_compat(prompt: str, model: str | None, log_path: Path,
 
 
 def invoke_backend(backend: str, binary: str, prompt: str, model: str | None,
-                   log_path: Path, timeout: int, acfg: dict | None = None) -> tuple[int, str, str]:
+                   log_path: Path, timeout: int, acfg: dict | None = None, *,
+                   schema: dict | None = None,
+                   system: str | None = None) -> tuple[int, str, str]:
     if backend_is_api(backend):
-        return _run_openai_compat(prompt, model, log_path, timeout, acfg or {})
+        return _run_openai_compat(prompt, model, log_path, timeout, acfg or {},
+                                  schema=schema, system=system)
     rc, elapsed = run_agent(backend_cmd(backend, binary, prompt, model), log_path, timeout)
     return rc, elapsed, ""
 

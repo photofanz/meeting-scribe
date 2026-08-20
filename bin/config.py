@@ -89,6 +89,13 @@ DEFAULTS: dict = {
                 "backend": "openai_compat",
                 "bin": None,
                 "model": None,
+                # How private mode produces a note.
+                #   evidence  Python extracts, clusters, quotes and verifies;
+                #             the model only fills small strict schemas. This
+                #             is the path a 27B model can actually walk.
+                #   legacy    the old single writer prompt, kept one version
+                #             for side-by-side comparison.
+                "pipeline": "evidence",
                 "api": {
                     "base_url": "http://127.0.0.1:1234/v1",
                     "api_key": "lm-studio",
@@ -251,7 +258,7 @@ def resolve_agent_config(meta: dict | None = None, *, cfg: dict | None = None) -
         out["api"] = _merge(out["api"], profile["api"])
     # Tool-loop knobs are per-profile: a local model that supports tool calling
     # can be driven like the CLI agents rather than as one-shot JSON completion.
-    for key in ("tool_loop", "tool_loop_max_steps"):
+    for key in ("tool_loop", "tool_loop_max_steps", "pipeline"):
         if key in profile:
             out[key] = profile[key]
     out["agent_preset"] = preset
