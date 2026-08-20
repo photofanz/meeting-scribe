@@ -344,6 +344,15 @@ def merge_evidence(parts: list[tuple[Chunk, dict | None]], turns: list[Turn],
             if turn is None or not literal:
                 drop("number_out_of_range")
                 continue
+            # `literal` is the one field allowed anywhere near the source text,
+            # so it is the one field checked against it here. Measured on a
+            # real run: the model reported 「50%」 and 「一百五十萬」 for turns
+            # whose text contained neither. Those must not reach the document,
+            # and "the verifier will mention it" is not the same as not
+            # shipping it — so they are dropped at the merge.
+            if squash(literal) not in squash(turn.text):
+                drop("number_not_in_its_turn")
+                continue
             key = (turn.index, literal)
             if key in seen_numbers:
                 continue

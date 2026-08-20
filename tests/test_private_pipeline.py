@@ -129,6 +129,14 @@ class MergeTests(unittest.TestCase):
         ev = self.merge([(chunk_of(self.turns, {0, 1, 2, 3, 4}), doubled)])
         self.assertEqual([n["literal"] for n in ev["numbers"]], ["十二萬", "十萬"])
 
+    def test_a_number_that_is_not_in_its_own_turn_never_reaches_the_document(self):
+        """The one near-verbatim field, checked against the source that owns it."""
+        wrong = json.loads(json.dumps(EVIDENCE_REPLY))
+        wrong["numbers"][0]["literal"] = "五十萬"    # turn 0 says 十二萬
+        ev = self.merge([(chunk_of(self.turns, {0, 1, 2, 3, 4}), wrong)])
+        self.assertEqual([n["literal"] for n in ev["numbers"]], ["十萬"])
+        self.assertEqual(ev["dropped"]["number_not_in_its_turn"], 1)
+
     def test_numbers_land_on_the_topic_that_owns_their_turn(self):
         ev = self.merge()
         self.assertEqual([n["literal"] for n in ev["topics"][0]["numbers"]], ["十二萬", "十萬"])
