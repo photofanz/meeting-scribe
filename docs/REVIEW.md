@@ -73,6 +73,64 @@ than one that confused one. The cap (`agent.max_questions`, default 8) is a
 product decision, not a technical one: past roughly eight cards people skip the
 whole screen, which is strictly worse than asking fewer questions.
 
+## Private mode takes a different second stage
+
+Everything above describes stage 2 as "hand the clean transcript to a writing
+agent". That works when the agent is Claude. It does not work when the agent is
+a 27B model on the LM Studio box, and the measurement was unambiguous: 2,572
+seconds to produce a 1,272-character note from a 21,000-character transcript —
+0.061 of its source, with every topic marked 待定.
+
+The cause was not the model being small. It was being asked to do long-range
+autonomous planning: read 20,000 characters, decide what matters, remember the
+skeleton, and write the whole document in one sustained pass. That is the one
+thing models this size are worst at, and no amount of prompt tuning fixes it.
+
+So private mode (`agent.profiles.private.pipeline: "evidence"`) routes around
+it — the work is cut until no single step needs long-range coherence:
+
+```
+  S2  map     one chunk, one strict json_schema  -> which turns discuss what
+  S3  reduce  pure Python  -> merge, drop the overlap, rejoin split topics,
+                              dedupe, order by turn, cut the quotations
+  S4  map     one topic, one strict json_schema  -> the prose for one section
+  S5  emit    pure Python  -> skeleton, tables, action_items.json, INDEX.md
+  S6  gate    pure Python  -> verify, rewrite only the sections that failed
+```
+
+Coverage stops depending on the model remembering how many topics there were,
+because `bin/private_pipeline.py` counts them. Structure stops depending on it
+remembering the skeleton, because Python emits it. And quotation stops
+depending on it copying carefully:
+
+> **The model returns turn numbers. It never returns transcript text.**
+
+Asked for a quotation, the model returned 「就這樣定了.」 for 「就這樣定了。」 —
+a full-width period quietly turned into an ASCII one. A model allowed to
+restate the source will edit it, and an edited quote is a fabricated quote.
+Every quotation is instead cut from `transcript_clean.md` by turn index, so
+`bin/note_verify.py` can check each one back against the same file. Fabrication
+is not discouraged here; it is unreachable.
+
+Three consequences worth knowing:
+
+- **The scan stage stops echoing the draft.** `SCAN_TASK_PRIVATE.md` asks only
+  for replacements, speakers and questions. Asking for the cleaned transcript
+  back inside a JSON string meant output ≈ input, and `max_output_tokens` cut
+  the reply mid-string on essentially every Chinese chunk.
+- **The model is checked before the work starts.** `capability_check()` reads
+  LM Studio's own metadata — `trained_for_tool_use`, `max_context_length`,
+  `format` — and refuses an unusable model in under a tenth of a second, naming
+  the models on the same machine that would have worked.
+- **`pipeline: "legacy"`** keeps the old single-writer path for one version, so
+  the two can be compared on the same job. `bin/note_eval.py` is what compares
+  them.
+
+```bash
+.venv/bin/python bin/note_verify.py <job_dir>        # audit one job
+.venv/bin/python bin/note_eval.py --archive          # score every archived job
+```
+
 ## Failure behaviour
 
 Every stage is written so that a partial failure degrades instead of aborting.
@@ -102,7 +160,8 @@ Every stage is written so that a partial failure degrades instead of aborting.
 | `questions.json`, `answers.json` | stage 1 / the web UI | yes |
 | `transcript_draft.md` | stage 1 | no |
 | `transcript_clean.md` (+ pdf/docx) | stage 2, in Python | no |
-| `note_*.md` (+ pdf/docx), `action_items.json`, `INDEX.md` | the writing agent | no |
+| `note_*.md` (+ pdf/docx), `action_items.json`, `INDEX.md` | the writing agent, or `private_pipeline.py` | no |
+| `.review/evidence.json`, `evidence_raw_NN.json`, `section_TNN.json` | private mode's S2/S3/S4 | no |
 | `delivery.json`, `agent_report.json` | stage 2 | no |
 | `.review/` scratch (per-chunk JSON, the exact write prompt) | both stages | no |
 
