@@ -515,5 +515,50 @@ class ParallelKnobTests(unittest.TestCase):
         self.assertIn("max_parallel", defaults["profiles"]["private"])
 
 
+class ParallelOrderTests(unittest.TestCase):
+    """Worker count must change the clock and nothing else.
+
+    S3 merges chunks in order — an evidence item's turn numbers, the topic
+    labels it tries to cluster with, and which of two near-identical labels
+    wins are all decided by the sequence the map stage hands back. If that
+    sequence tracked completion order instead of input order, raising
+    max_parallel would quietly reshuffle the merge and produce a different
+    document from the same meeting, which would make every measurement of the
+    knob meaningless.
+    """
+
+    class _Job:
+        def __init__(self, workers):
+            self.acfg = {"max_parallel": workers}
+
+    @staticmethod
+    def _slow(i):
+        # Later items finish first, so completion order is the reverse of
+        # input order and any ordering bug is certain rather than likely.
+        import time
+        time.sleep((12 - i) * 0.001)
+        return i
+
+    def test_results_come_back_in_input_order_at_every_worker_count(self):
+        items = list(range(12))
+        for workers in (1, 2, 3, 6, 8, 12, 16):
+            got = pp._parallel(self._Job(workers), items, self._slow)
+            self.assertEqual(got, items, f"max_parallel={workers} reordered the results")
+
+    def test_a_single_item_still_comes_back_wrapped_in_a_list(self):
+        # The <=1 shortcut skips the pool entirely; it must not skip the shape.
+        self.assertEqual(pp._parallel(self._Job(8), [7], lambda x: x * 2), [14])
+        self.assertEqual(pp._parallel(self._Job(8), [], lambda x: x), [])
+
+    def test_a_failing_item_stops_the_stage_rather_than_vanishing(self):
+        def boom(i):
+            if i == 5:
+                raise RuntimeError("chunk 5 blew up")
+            return i
+
+        with self.assertRaises(RuntimeError):
+            pp._parallel(self._Job(8), list(range(20)), boom)
+
+
 if __name__ == "__main__":
     unittest.main()
