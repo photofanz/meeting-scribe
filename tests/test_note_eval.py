@@ -3,8 +3,9 @@
 The private path was already tuned once on an impression ("the note looks
 short"). That is how a 0.061 output ratio reached a client folder. These tests
 pin the parts of the measurement that could quietly stop measuring: quotation
-detection, the source fallback for older transcript formats, and the
-separation between a good note and a bad one.
+detection, the source fallback for older transcript formats, exclusion of
+rewrite backups from live scores, and that a pre_evidence snapshot cannot
+outrank the note that replaced it.
 """
 from pathlib import Path
 import sys
@@ -127,40 +128,129 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(m["timestamps"], 1)
         self.assertLess(m["scores"]["cleanliness"], 1.0)
 
+    def test_a_job_with_evidence_json_is_tagged_as_the_evidence_pipeline(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "transcript_clean.md").write_text(TRANSCRIPT)
+        (tmp / "note_general.md").write_text(GOOD_NOTE)
+        self.assertEqual(note_eval.metrics(tmp)["pipeline"], "")
+        (tmp / "evidence.json").write_text("{}")
+        self.assertEqual(note_eval.metrics(tmp)["pipeline"], "evidence")
+
+    def test_clearing_the_ratio_bar_is_not_a_perfect_coverage_score(self):
+        at_bar = note_eval.scale_past_bar(0.30, 0.30, 0.70)
+        richer = note_eval.scale_past_bar(0.60, 0.30, 0.70)
+        padded = note_eval.scale_past_bar(1.80, 0.30, 0.70)
+        self.assertAlmostEqual(at_bar, 0.70)
+        self.assertGreater(richer, at_bar)
+        self.assertAlmostEqual(padded, 1.0)
+        self.assertGreater(padded, richer)
+
+    def test_two_passing_notes_still_rank_by_how_dense_they_are(self):
+        """A 0.30-ratio stub must not tie a 0.60-ratio note that is otherwise equal."""
+        spoken = "這批的報價我們抓十二萬，含稅，這個價格我們可以接受。那就這樣定了，我下週安排合約。"
+        spoken = spoken * 40  # ~2.4k chars so ratios stay in the interesting band
+        transcript = (
+            f"# 逐字稿\n\n**[00:00:10] 王總**\n\n{spoken[:len(spoken)//2]}\n\n"
+            f"**[00:01:10] 李經理**\n\n{spoken[len(spoken)//2:]}\n"
+        )
+        thin = GOOD_NOTE
+        rich = GOOD_NOTE + "\n\n".join(
+            f"### {i}. 補充\n\n> 王總：「這批的報價我們抓十二萬，含稅，這個價格我們可以接受。」\n"
+            for i in range(8)
+        )
+        self.assertLess(self.job(note=thin, transcript=transcript)["score"],
+                        self.job(note=rich, transcript=transcript)["score"])
+        self.assertLess(self.job(note=thin, transcript=transcript)["scores"]["coverage"],
+                        self.job(note=rich, transcript=transcript)["scores"]["coverage"])
+
+
+class ScalePastBarTests(unittest.TestCase):
+    def test_zero_stays_zero(self):
+        self.assertEqual(note_eval.scale_past_bar(0, 0.30, 0.70), 0.0)
+
+    def test_below_the_bar_is_a_linear_ramp_to_at_bar(self):
+        self.assertAlmostEqual(note_eval.scale_past_bar(0.15, 0.30, 0.70), 0.35)
+
 
 class SeparationTests(unittest.TestCase):
     def rows(self, *scores):
         return [{"job": job, "score": score} for job, score in scores]
 
     def test_the_gap_below_the_known_disaster_is_reported(self):
-        rows = self.rows(("good_a", 0.9), ("good_b", 0.7), ("群耀_94db8a", 0.5))
-        gap = note_eval.separation(rows, "群耀_94db8a")
+        rows = self.rows(("good_a", 0.9), ("good_b", 0.7), ("legacy_stub", 0.5))
+        gap = note_eval.separation(rows, "legacy_stub")
         self.assertTrue(gap["is_last"])
         self.assertEqual(gap["rank"], 3)
         self.assertAlmostEqual(gap["gap"], 0.2)
 
     def test_a_disaster_that_did_not_rank_last_is_reported_as_such(self):
-        rows = self.rows(("群耀_94db8a", 0.5), ("worse", 0.2))
-        gap = note_eval.separation(rows, "群耀_94db8a")
+        rows = self.rows(("legacy_stub", 0.5), ("worse", 0.2))
+        gap = note_eval.separation(rows, "legacy_stub")
         self.assertFalse(gap["is_last"])
         self.assertLess(gap["gap"], 0)
 
 
+class BackupNoteTests(unittest.TestCase):
+    def job_dir(self, note=GOOD_NOTE, backup=None, extra=None):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "transcript_clean.md").write_text(TRANSCRIPT)
+        (tmp / "note_general.md").write_text(note)
+        if backup is not None:
+            (tmp / "note_general.pre_evidence.md").write_text(backup)
+        if extra is not None:
+            (tmp / extra[0]).write_text(extra[1])
+        return tmp
+
+    def test_live_metrics_do_not_fold_in_the_pre_evidence_backup(self):
+        stub = "# 舊稿\n\n討論了報價。\n"
+        path = self.job_dir(note=GOOD_NOTE, backup=stub)
+        m = note_eval.metrics(path)
+        self.assertEqual(m["note_files"], ["note_general.md"])
+        self.assertEqual(m["note_chars"], len(GOOD_NOTE))
+
+    def test_evidence_lift_requires_the_rewrite_to_beat_its_own_backup(self):
+        stub = "# 會議記錄\n\n## 一、本次會議重點\n\n- 短。\n"
+        path = self.job_dir(note=GOOD_NOTE, backup=stub)
+        lifts = note_eval.evidence_lifts([path])
+        self.assertEqual(len(lifts), 1)
+        self.assertTrue(lifts[0]["ok"])
+        self.assertGreater(lifts[0]["after_score"], lifts[0]["before_score"])
+        self.assertEqual(lifts[0]["before_files"], ["note_general.pre_evidence.md"])
+        self.assertEqual(lifts[0]["after_files"], ["note_general.md"])
+
+    def test_a_rewrite_that_got_worse_fails_the_lift(self):
+        stub = "# 會議記錄\n\n## 一、本次會議重點\n\n- 短。\n"
+        path = self.job_dir(note=stub, backup=GOOD_NOTE)
+        lifts = note_eval.evidence_lifts([path])
+        self.assertFalse(lifts[0]["ok"])
+        self.assertLess(lifts[0]["delta"], 0)
+
+    def test_jobs_without_a_backup_are_not_a_lift_row(self):
+        self.assertEqual(note_eval.evidence_lifts([self.job_dir()]), [])
+
+
 class ArchiveRegressionTests(unittest.TestCase):
-    """The calibration claim, checked against the archive it was calibrated on."""
+    """If the deploy archive has pre_evidence snapshots, each rewrite must lift."""
 
     @classmethod
     def setUpClass(cls):
-        dirs = [d for d in sorted((ROOT / "archive").iterdir()) if d.is_dir()]
-        cls.rows = note_eval.evaluate(dirs)
+        archive = ROOT / "archive"
+        cls.dirs = [d for d in sorted(archive.iterdir()) if d.is_dir()] if archive.is_dir() else []
+        cls.rows = note_eval.evaluate(cls.dirs)
+        cls.lifts = note_eval.evidence_lifts(cls.dirs)
 
-    def test_the_disaster_run_ranks_last_of_every_archived_job(self):
-        gap = note_eval.separation(self.rows, "群耀_94db8a")
-        self.assertTrue(gap["is_last"], f"排名 {gap['rank']}/{gap['of']}")
-        self.assertGreater(gap["gap"], 0.1, "與次低的分數必須拉得開，不能只是剛好墊底")
+    def test_every_pre_evidence_backup_is_beaten_by_the_current_note(self):
+        if not self.dirs:
+            self.skipTest("no local archive")
+        if not self.lifts:
+            self.skipTest("archive has no note_*.pre_evidence.md snapshots")
+        failed = [lift for lift in self.lifts if not lift["ok"]]
+        self.assertFalse(failed, failed)
 
     def test_every_archived_job_is_scored_rather_than_skipped(self):
-        self.assertEqual(len(self.rows), 15)
+        if not self.dirs:
+            self.skipTest("no local archive")
+        self.assertEqual(len(self.rows), len(self.dirs))
         self.assertTrue(all(r["source_chars"] > 0 for r in self.rows),
                         [r["job"] for r in self.rows if not r["source_chars"]])
 

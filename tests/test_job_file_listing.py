@@ -67,6 +67,14 @@ class DeliverableAllowlistTests(unittest.TestCase):
             "note_general.md", "note_general.pdf", "note_general.docx",
         ])
 
+    def test_evidence_json_is_not_offered_as_a_download(self):
+        rows = jobstate.list_files(make_job(JOB_FILES + ["evidence.json"]),
+                                   formats=["md", "pdf", "docx"])
+        self.assertNotIn("evidence.json", [r["name"] for r in rows])
+
+    def test_evidence_json_is_kept_when_outputs_are_cleaned(self):
+        self.assertIn("evidence.json", jobstate.PROTECTED)
+
 
 if __name__ == "__main__":
     unittest.main()

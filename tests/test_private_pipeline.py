@@ -9,6 +9,7 @@ data in and documents out.
 from pathlib import Path
 import json
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -615,6 +616,20 @@ class ParallelOrderTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             pp._parallel(self._Job(8), list(range(20)), boom)
+
+
+class PersistEvidenceTests(unittest.TestCase):
+    def test_the_merge_is_written_to_the_job_root_not_only_scratch(self):
+        tmp = Path(tempfile.mkdtemp())
+        work = tmp / ".review"
+        work.mkdir()
+        job = type("Job", (), {"dir": tmp, "work": work})()
+        evidence = {"topics": [{"id": "T01"}], "dropped": {}}
+        path = pp.persist_merged_evidence(job, evidence)
+        self.assertEqual(path, tmp / "evidence.json")
+        self.assertTrue((tmp / "evidence.json").is_file())
+        self.assertTrue((work / "evidence.json").is_file())
+        self.assertEqual(json.loads(path.read_text())["topics"][0]["id"], "T01")
 
 
 if __name__ == "__main__":

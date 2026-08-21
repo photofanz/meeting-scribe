@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import shutil
 import subprocess
 import sys
 import zipfile
@@ -24,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import CONFIG  # noqa: E402
+from make_pdf import find_pandoc  # noqa: E402
 
 REF = Path(__file__).resolve().parent.parent / "templates" / "reference.docx"
 
@@ -44,7 +44,10 @@ def build_reference(dst: Path) -> Path:
     if dst.exists():
         return dst
     dst.parent.mkdir(parents=True, exist_ok=True)
-    raw = subprocess.run(["pandoc", "--print-default-data-file", "reference.docx"],
+    pandoc = find_pandoc()
+    if not pandoc:
+        raise FileNotFoundError("pandoc not found")
+    raw = subprocess.run([pandoc, "--print-default-data-file", "reference.docx"],
                          capture_output=True, check=True).stdout
     tmp = dst.with_suffix(".raw.docx")
     tmp.write_bytes(raw)
@@ -104,7 +107,8 @@ def main() -> None:
     ap.add_argument("--duration", default="")
     a = ap.parse_args()
 
-    if not shutil.which("pandoc"):
+    pandoc = find_pandoc()
+    if not pandoc:
         print("pandoc not found — cannot build .docx", file=sys.stderr)
         sys.exit(2)
 
@@ -133,7 +137,7 @@ def main() -> None:
     ref = build_reference(REF)
 
     r = subprocess.run(
-        ["pandoc", "-f", "markdown+pipe_tables+hard_line_breaks",
+        [pandoc, "-f", "markdown+pipe_tables+hard_line_breaks",
          "-t", "docx", f"--reference-doc={ref}", "-o", str(out)],
         input=doc, capture_output=True, text=True)
     if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:

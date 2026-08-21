@@ -952,6 +952,21 @@ def write_overview(job, evidence: dict, sections: list[dict],
     return lines, False
 
 
+def persist_merged_evidence(job, evidence: dict) -> Path:
+    """Write the S3 merge to scratch *and* to the job folder.
+
+    `.review/evidence.json` is debug (clean outputs deletes `.review/`).
+    The job-root copy is the audit trail: visible in `ls`, readable after
+    scratch is gone, and what `note_eval` / `note_verify` look at.
+    """
+    blob = json.dumps(evidence, ensure_ascii=False, indent=2)
+    job.work.mkdir(parents=True, exist_ok=True)
+    (job.work / "evidence.json").write_text(blob)
+    durable = job.dir / "evidence.json"
+    durable.write_text(blob)
+    return durable
+
+
 # --------------------------------------------------------------------------- #
 # entry point
 # --------------------------------------------------------------------------- #
@@ -978,8 +993,7 @@ def run(job, res: dict, source: Path) -> dict:
 
     parts = extract_evidence(job, chunks, meta, job.user_context)
     evidence = merge_evidence(parts, turns, roster=roster_of(meta, res))
-    (job.work / "evidence.json").write_text(
-        json.dumps(evidence, ensure_ascii=False, indent=2))
+    persist_merged_evidence(job, evidence)
     print(f"[private] S3 merged: {len(evidence['topics'])} topic(s), "
           f"{len(evidence['actions'])} action(s), {len(evidence['numbers'])} number(s), "
           f"dropped={evidence['dropped'] or '{}'}")

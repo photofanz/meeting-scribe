@@ -88,7 +88,7 @@
         "bin": null,
         "model": "qwen3.8-27b-mtplx",
         "api": {
-          "base_url": "http://100.85.219.106:1234/v1",
+          "base_url": "http://127.0.0.1:1234/v1",
           "api_key": "lm-studio",
           "endpoint": "chat_completions",
           "temperature": 0.1,
