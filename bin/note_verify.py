@@ -247,6 +247,14 @@ def report(findings: list[Finding]) -> None:
         print(f"[verify]   …另外 {len(findings) - 12} 項")
 
 
+def load_evidence(job_dir: Path) -> dict | None:
+    """Prefer the durable job-root copy; fall back to `.review/` scratch."""
+    for path in (job_dir / "evidence.json", job_dir / ".review" / "evidence.json"):
+        if path.is_file():
+            return json.loads(path.read_text())
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Audit a private-pipeline job's deliverables.")
     ap.add_argument("job_dir")
@@ -254,11 +262,11 @@ def main() -> int:
     args = ap.parse_args()
 
     job_dir = Path(args.job_dir).expanduser().resolve()
-    evidence_path = job_dir / ".review" / "evidence.json"
-    if not evidence_path.exists():
-        print(f"[verify] 找不到 {evidence_path}——這個 job 不是 evidence 管線產出的？")
+    evidence = load_evidence(job_dir)
+    if evidence is None:
+        print(f"[verify] 找不到 {job_dir / 'evidence.json'}——"
+              "這個 job 不是 evidence 管線產出的？")
         return 2
-    evidence = json.loads(evidence_path.read_text())
     turns = [t for t in chunker.parse_transcript(
         (job_dir / "transcript_clean.md").read_text(errors="ignore")) if not t.is_preamble]
     findings = verify(job_dir, evidence, turns)

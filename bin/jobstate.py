@@ -55,7 +55,7 @@ OUTPUT_GLOBS = (
 # unrepeatable.
 PROTECTED = ("source.*", "meta.json", "status.json", "state.json",
              "transcript.md", "transcript.json", "transcript.txt",
-             "questions.json", "answers.json")
+             "questions.json", "answers.json", "evidence.json")
 
 
 def _atomic_write(path: Path, data: dict) -> None:

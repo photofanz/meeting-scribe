@@ -199,7 +199,7 @@ archive/<YYYY-MM-DD>_<對象>_<6碼>/
 | 模式 | 典型後端 | 用途 |
 |---|---|---|
 | **一般模式** | `claude` / `codex` | 日常會議整理 |
-| **保密模式** | `openai_compat` + LM Studio | 敏感會議與本地模型處理 |
+| **保密模式** | `openai_compat` + LM Studio + **evidence 管線** | 本地模型只填 schema；結構、引文、驗證由 Python 做 |
 
 ### LM Studio cleanup 策略
 

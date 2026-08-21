@@ -197,7 +197,7 @@ This means you can:
 | Mode | Typical backend | Use |
 |---|---|---|
 | **General mode** | `claude` / `codex` | Everyday meeting processing |
-| **Privacy mode** | `openai_compat` + LM Studio | Sensitive meetings and local-model workflows |
+| **Privacy mode** | `openai_compat` + LM Studio + **evidence pipeline** | Local model fills a schema; Python owns quotes, structure, and verification |
 
 ### LM Studio cleanup strategy
 

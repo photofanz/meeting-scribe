@@ -38,6 +38,24 @@ def find_chrome() -> str | None:
     return shutil.which("chromium") or shutil.which("google-chrome")
 
 
+# launchd sets Homebrew on PATH; SSH and some CLI invocations do not.
+# shutil.which("pandoc") alone then fails even though pandoc is installed.
+PANDOC_CANDIDATES = (
+    "/opt/homebrew/bin/pandoc",
+    "/usr/local/bin/pandoc",
+)
+
+
+def find_pandoc() -> str | None:
+    found = shutil.which("pandoc")
+    if found:
+        return found
+    for c in PANDOC_CANDIDATES:
+        if Path(c).is_file():
+            return c
+    return None
+
+
 CHROME = find_chrome() or CHROME_CANDIDATES[0]
 
 KINDS = {
@@ -133,9 +151,10 @@ TEMPLATE = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 
 def md_to_html(md: str) -> str:
     """Prefer pandoc (best tables); fall back to python-markdown."""
-    if shutil.which("pandoc"):
+    pandoc = find_pandoc()
+    if pandoc:
         r = subprocess.run(
-            ["pandoc", "-f", "markdown+pipe_tables+hard_line_breaks",
+            [pandoc, "-f", "markdown+pipe_tables+hard_line_breaks",
              "-t", "html", "--no-highlight"],
             input=md, capture_output=True, text=True)
         if r.returncode == 0:

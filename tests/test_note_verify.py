@@ -211,5 +211,24 @@ class AutofixTests(unittest.TestCase):
         self.assertNotIn("报价金额", self.job.note())
 
 
+class LoadEvidenceTests(unittest.TestCase):
+    def test_job_root_copy_wins_over_scratch(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / ".review").mkdir()
+        (tmp / ".review" / "evidence.json").write_text('{"where": "scratch"}')
+        (tmp / "evidence.json").write_text('{"where": "root"}')
+        self.assertEqual(note_verify.load_evidence(tmp)["where"], "root")
+
+    def test_scratch_is_used_when_the_durable_copy_is_missing(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / ".review").mkdir()
+        (tmp / ".review" / "evidence.json").write_text('{"where": "scratch"}')
+        self.assertEqual(note_verify.load_evidence(tmp)["where"], "scratch")
+
+    def test_missing_everywhere_returns_none(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.assertIsNone(note_verify.load_evidence(tmp))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 # 私密模式管線重構設計（Local Evidence Pipeline）
 
-狀態：設計定案，實作中
-日期：2026-08-19
+狀態：P0–P4 已落地（2026-08-21 以 `2026-08-12_群耀_94db8a` 實跑 evidence 管線：927s、產出比 0.641、eval 0.979；舊單次 writer 為 0.071 / 0.521）。S7 grounding critic 仍未做。
+日期：2026-08-19；實測補記 2026-08-21
 
 ## 0. 為什麼要推翻現有設計
 
@@ -177,7 +177,7 @@ def _openai_compat_request(prompt, model, acfg, *,
    組成該議題的證據包
 6. **順序**：依 `min(turns)` 排序，永遠照會議實際順序
 
-輸出 `work/evidence.json`，並保留 `work/evidence_raw_NN.json` 供除錯。
+輸出 `evidence.json`（job 根目錄，clean outputs 會保留）以及 `.review/evidence.json`（scratch）。`evidence_raw_NN.json` 仍只留在 `.review/` 供除錯。
 
 ### 3.6 S4 逐議題撰寫
 

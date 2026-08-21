@@ -1,9 +1,11 @@
 # 接上 AI Agent
 
 轉寫管線本身不需要 agent —— 跑完你就有 `transcript.md` 了。
-Agent 負責的是**後半段**：清稿、寫會議記錄、抽待辦、歸檔。
+後半段（清稿、寫會議記錄、抽待辦）依 `config.json` 的 `agent.mode` 與 UI 上的 AI preset 決定。
 
-有兩種接法，選一種就好：
+**現行預設**是 `agent.mode = "review"`：scan → 問題卡 → 再寫稿。一般模式走 Claude / Codex CLI；保密模式走獨立的 **evidence 管線**（`bin/private_pipeline.py`，模型只填 schema，引文由 Python 依 turn 編號擷取）。細節見 [`docs/REVIEW.md`](REVIEW.md)。
+
+下面 A / B 仍可用，但不是現在的預設。
 
 | | **A. 對話 agent（manual）** | **B. 本機 CLI（auto）** |
 |---|---|---|
@@ -12,8 +14,6 @@ Agent 負責的是**後半段**：清稿、寫會議記錄、抽待辦、歸檔�
 | 需要你在場 | 要 | **不用** |
 | 中途能追問 | 能 | 不能（禁則已寫死在 prompt 裡） |
 | 適合 | 想邊看邊改、要客製版本 | 每天固定跑、只想收檔案 |
-
-預設是 A。改成 B 只要改 `config.json` 一個欄位。
 
 ---
 
@@ -114,7 +114,7 @@ cat archive/<job_id>/agent_report.json # agent 自己標的不確定處
 
 ---
 
-## A. 對話 agent（預設）
+## A. 對話 agent（manual）
 
 ### 觸發流程
 

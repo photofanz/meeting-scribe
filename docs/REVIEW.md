@@ -161,7 +161,8 @@ Every stage is written so that a partial failure degrades instead of aborting.
 | `transcript_draft.md` | stage 1 | no |
 | `transcript_clean.md` (+ pdf/docx) | stage 2, in Python | no |
 | `note_*.md` (+ pdf/docx), `action_items.json`, `INDEX.md` | the writing agent, or `private_pipeline.py` | no |
-| `.review/evidence.json`, `evidence_raw_NN.json`, `section_TNN.json` | private mode's S2/S3/S4 | no |
+| `evidence.json` | private mode S3 merge (durable copy) | yes |
+| `.review/evidence.json`, `evidence_raw_NN.json`, `section_TNN.json` | private mode's S2/S3/S4 scratch | no |
 | `delivery.json`, `agent_report.json` | stage 2 | no |
 | `.review/` scratch (per-chunk JSON, the exact write prompt) | both stages | no |
 
